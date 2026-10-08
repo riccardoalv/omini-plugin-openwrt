@@ -1,0 +1,10 @@
+{
+  "phy0-ap0": {"results": [
+    {"mac": "AA:BB:CC:DD:EE:02", "signal": -61, "signal_avg": -60, "noise": -95, "inactive": 120, "connected_time": 3600, "thr": 50000, "authorized": true, "authenticated": true, "preamble": "long", "wme": true, "mfp": true, "tdls": false, "rx": {"drop_misc": 0, "packets": 1000, "bytes": 200000, "ht": true, "vht": false, "he": false, "mhz": 20, "rate": 72200, "mcs": 7, "40mhz": false, "short_gi": true}, "tx": {"drop_misc": 0, "packets": 900, "bytes": 300000, "ht": true, "vht": false, "he": false, "mhz": 20, "rate": 144400, "mcs": 15, "40mhz": false, "short_gi": true}}
+  ]},
+  "phy1-ap0": {"results": [
+    {"mac": "aa:bb:cc:dd:ee:01", "signal": -48, "noise": -92, "inactive": 10, "rx": {"rate": 1200950, "mhz": 80, "he": true}, "tx": {"rate": 1134200, "mhz": 80, "he": true}},
+    {"mac": "AA-BB-CC-DD-EE-05", "signal": 0, "rx": {"rate": 0}, "tx": {}}
+  ]},
+  "phy1-sta0": {"results": [{"mac": "11:22:33:44:55:66", "signal": -70}]}
+}

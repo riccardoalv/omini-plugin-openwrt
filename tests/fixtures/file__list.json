@@ -1,0 +1,6 @@
+{
+  "/sys/class/thermal": {"entries": [
+    {"name": "cooling_device0", "type": "symlink"},
+    {"name": "thermal_zone0", "type": "symlink"}
+  ]}
+}

@@ -1,0 +1,36 @@
+id: openwrt
+name: OpenWrt
+version: 0.1.0
+protocol: 1
+entrypoint: main.py
+timeout_s: 60
+description: >-
+  OpenWrt routers and access points through ubus over HTTP (the API LuCI uses):
+  ports with link speed, traffic and bridge VLANs, WANs, Wi-Fi networks and
+  clients with signal and rates, ARP, DHCP leases, host names, memory, load,
+  disks, temperatures and uptime. Read-only.
+author: Omini
+homepage: https://github.com/riccardoalv/omini-plugin-openwrt
+fields:
+  - key: url
+    type: url
+    label: Address
+    required: true
+    help: The router's web interface (LuCI), e.g. https://192.168.1.1 — or http:// if it has no HTTPS.
+  - key: username
+    type: string
+    label: Username
+    required: true
+    default: omini
+    help: >-
+      A read-only rpcd login created for Omini (see the plugin's README for the
+      exact files). Using root works too, but is not recommended.
+  - key: password
+    type: secret
+    label: Password
+    required: true
+  - key: verify_tls
+    type: bool
+    label: Verify the TLS certificate
+    default: false
+    help: OpenWrt uses a self-signed certificate by default; turn this on if yours is trusted.

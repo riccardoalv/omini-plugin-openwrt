@@ -1,0 +1,5 @@
+{
+  "phy0-ap0": {"phy": "phy0", "ssid": "Office", "bssid": "94:83:C4:00:00:03", "country": "US", "mode": "Master", "channel": 6, "center_chan1": 6, "frequency": 2437, "frequency_offset": 0, "txpower": 20, "quality": 70, "quality_max": 70, "signal": -40, "noise": -95, "bitrate": 286800, "encryption": {"enabled": true, "wpa": [2], "authentication": ["psk"], "ciphers": ["ccmp"]}, "htmodes": ["HT20", "HT40", "HE20", "HE40"], "hwmodes": ["b", "g", "n", "ax"], "hwmode": "ax", "htmode": "HE20", "hardware": {"name": "MediaTek MT7986"}},
+  "phy1-ap0": {"phy": "phy1", "ssid": "Office", "bssid": "94:83:C4:00:00:04", "mode": "Master", "channel": 36, "frequency": 5180, "hwmodes": ["a", "n", "ac", "ax"], "htmode": "HE80"},
+  "phy1-sta0": {"phy": "phy1", "ssid": "Upstream", "mode": "Client", "channel": 36, "frequency": 5180, "hwmodes": ["a", "n", "ac", "ax"]}
+}

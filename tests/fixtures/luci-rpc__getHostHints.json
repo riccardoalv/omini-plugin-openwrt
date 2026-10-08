@@ -1,0 +1,5 @@
+{
+  "AA:BB:CC:DD:EE:01": {"ipaddrs": ["192.168.1.50"], "ip6addrs": ["fe80::1"], "name": "laptop"},
+  "AA:BB:CC:DD:EE:02": {"ipaddrs": ["192.168.1.60"], "ip6addrs": []},
+  "AA:BB:CC:DD:EE:03": {"ipaddrs": [], "ip6addrs": ["fd12:3456:789a::3"], "name": "printer"}
+}

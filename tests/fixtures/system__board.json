@@ -1,0 +1,15 @@
+{
+  "kernel": "5.15.150",
+  "hostname": "gw-office",
+  "system": "ARMv8 Processor rev 4",
+  "model": "GL.iNet GL-MT6000",
+  "board_name": "glinet,gl-mt6000",
+  "rootfs_type": "squashfs",
+  "release": {
+    "distribution": "OpenWrt",
+    "version": "23.05.3",
+    "revision": "r23809-234f1a2efa",
+    "target": "mediatek/filogic",
+    "description": "OpenWrt 23.05.3 r23809-234f1a2efa"
+  }
+}

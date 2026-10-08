@@ -1,0 +1,8 @@
+{
+  "dhcp_leases": [
+    {"expires": 43000, "hostname": "laptop", "macaddr": "aa:bb:cc:dd:ee:01", "ipaddr": "192.168.1.50"},
+    {"expires": 600, "hostname": "phone", "macaddr": "AA:BB:CC:DD:EE:02", "ipaddr": "192.168.1.60"},
+    {"expires": false, "macaddr": "aa:bb:cc:dd:ee:04", "ipaddr": "192.168.1.70"}
+  ],
+  "dhcp6_leases": []
+}

@@ -1,0 +1,5 @@
+{
+  "/proc/net/arp": "IP address       HW type     Flags       HW address            Mask     Device\n192.168.1.50     0x1         0x2         aa:bb:cc:dd:ee:01     *        br-lan.1\n192.168.1.99     0x1         0x0         00:00:00:00:00:00     *        br-lan.1\n203.0.113.1      0x1         0x2         00:11:22:33:44:55     *        eth1\n",
+  "/sys/class/thermal/thermal_zone0/type": "cpu-thermal\n",
+  "/sys/class/thermal/thermal_zone0/temp": "52300\n"
+}

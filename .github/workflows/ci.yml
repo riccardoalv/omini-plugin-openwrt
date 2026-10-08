@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # The SDK lives in the Omini repository, next to the plugin (../omini).
+      - uses: actions/checkout@v5
+        with:
+          path: omini-plugin-openwrt
+      - uses: actions/checkout@v5
+        with:
+          repository: riccardoalv/omini
+          path: omini
+      - uses: astral-sh/setup-uv@v6
+      - name: Lint
+        working-directory: omini-plugin-openwrt
+        run: uv run ruff check . && uv run ruff format --check .
+      - name: Test
+        working-directory: omini-plugin-openwrt
+        run: uv run pytest -q
