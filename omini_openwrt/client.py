@@ -1,7 +1,8 @@
 """Minimal ubus JSON-RPC client (uhttpd-mod-ubus, the API LuCI uses).
 
-Every request is a JSON-RPC 2.0 POST to <url>/ubus. Only ubus methods that
-read are ever called; POST is simply how JSON-RPC carries the request.
+Every request is a JSON-RPC 2.0 POST to <url>/ubus (POST is simply how
+JSON-RPC carries the request). collect and test call only ubus methods that
+read; only apply calls uci methods that change the network configuration.
 https://openwrt.org/docs/techref/ubus (section "Access to ubus over HTTP")
 """
 

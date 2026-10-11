@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import ipaddress
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlparse
 
 from omini_sdk import (
     ArpEntry,
+    Change,
     Config,
     Device,
     DhcpLease,
@@ -25,7 +27,7 @@ from omini_sdk import (
     log,
 )
 
-from omini_openwrt.client import AccessDenied, Client, UbusError
+from omini_openwrt.client import AccessDenied, Client, UbusError, Unavailable
 
 PLUGIN_ID = "openwrt"
 
@@ -60,6 +62,9 @@ OPTIONAL = {
     "leases": ("luci-rpc", "getDHCPLeases"),
     "wifi": ("iwinfo", "devices"),
 }
+
+# UCI option values that mean "off" (uci stores booleans as strings).
+OFF = {"0", "false", "off", "no", "disabled"}
 
 
 def client_from(cfg: Config) -> Client:
@@ -234,6 +239,8 @@ def read_all(client: Client) -> tuple[dict[str, Any], list[str]]:
         wifi.append((dev, info, assoc))
     raw["wifi"] = wifi
 
+    # The network configuration: which ports are disabled (enabled '0').
+    raw["config"] = r.optional("uci", "get", {"config": "network"}, report="uci get network")
     raw["arp"] = r.file_read("/proc/net/arp")
     raw["temps"] = read_temperatures(r)
     return raw, r.denied
@@ -307,6 +314,46 @@ def bridge_vlans(devices: dict[str, Any]) -> tuple[dict[str, PortVlans], list[tu
     return out, found
 
 
+def config_sections(config: Any, kind: str) -> list[dict[str, Any]]:
+    """Sections of one type from `uci get` of a whole config."""
+    values = config.get("values") if isinstance(config, dict) else None
+    if not isinstance(values, dict):
+        return []
+    return [s for s in values.values() if isinstance(s, dict) and s.get(".type") == kind]
+
+
+def disabled_ports(config: Any) -> set[str]:
+    """Ports disabled in the configuration: a plain `config device` section
+    (no type: not a bridge or VLAN) with `option enabled '0'`."""
+    out = set()
+    for s in config_sections(config, "device"):
+        name, enabled = s.get("name"), s.get("enabled")
+        if s.get("type") or not isinstance(name, str) or not isinstance(enabled, str):
+            continue
+        if enabled.strip().lower() in OFF:
+            out.add(name)
+    return out
+
+
+def conduits(devices: dict[str, Any]) -> set[str]:
+    """The CPU ports of DSA switches (eth0 on most routers): every LAN port's
+    frames go through them, so they are not ports to turn off. netifd names
+    them ("conduit") on recent releases; else they share the DSA ports' MAC."""
+    named = {st.get("conduit") for st in devices.values()}
+    dsa_macs = {
+        norm_mac(st.get("macaddr"))
+        for st in devices.values()
+        if str(st.get("devtype") or "").lower() == "dsa"
+    } - {None}
+    out = {n for n in named if isinstance(n, str)}
+    for name, st in devices.items():
+        if str(st.get("devtype") or "").lower() == "ethernet" and (
+            norm_mac(st.get("macaddr")) in dsa_macs
+        ):
+            out.add(name)
+    return out
+
+
 def build(raw: dict[str, Any], host: str | None) -> Device:
     board = raw["board"] if isinstance(raw["board"], dict) else {}
     info = raw["info"] if isinstance(raw["info"], dict) else {}
@@ -352,17 +399,31 @@ def build(raw: dict[str, Any], host: str | None) -> Device:
         )
 
     port_vlans, vlan_list = bridge_vlans(devices)
+    # A port disabled in the configuration is not "present" for netifd, which
+    # then leaves it out of `network.device status`: it is added from the
+    # configuration, down and disabled.
+    disabled = disabled_ports(raw.get("config"))
+    cpu_ports = conduits(devices)
+    for name in disabled:
+        devices.setdefault(name, {"present": False})
 
     interfaces: list[Interface] = []
     seen = set()
     for name in sorted(devices):
         st = devices[name]
-        if name == "lo" or st.get("present") is False:
+        if name == "lo" or (st.get("present") is False and name not in disabled):
             continue
         seen.add(name)
-        kind = iface_type(name, st)
+        kind = "ethernet" if name in disabled else iface_type(name, st)
         speed, duplex = parse_speed(st.get("speed"))
         up = st.get("carrier") if isinstance(st.get("carrier"), bool) else st.get("up")
+        if name in disabled:
+            up = False
+        # Administrative state of physical ports: netifd lists a port it has
+        # disabled as not present, so a present one is enabled.
+        enabled = None
+        if kind == "ethernet" and name not in cpu_ports:
+            enabled = name not in disabled
         stats = st.get("statistics") if isinstance(st.get("statistics"), dict) else {}
         parent, vid = vlan_of(name) if kind == "vlan" else (None, None)
         members = st.get("bridge-members")
@@ -377,6 +438,7 @@ def build(raw: dict[str, Any], host: str | None) -> Device:
                 parent=parent or parent_of.get(name),
                 members=[str(m) for m in members] if members else None,
                 up=up if isinstance(up, bool) else None,
+                enabled=enabled,
                 speed_mbps=speed if up is not False else None,
                 duplex=duplex if up is not False else None,
                 rx_bytes=counter(stats.get("rx_bytes")),
@@ -622,3 +684,186 @@ def test(cfg: Config) -> str:
     if denied:
         msg += " Not allowed by the ACL: " + ", ".join(denied) + "."
     return msg
+
+
+# --- changes ---------------------------------------------------------------
+
+# How long rpcd waits for the confirmation before it restores the previous
+# configuration by itself (`uci apply` with rollback), and how long the
+# plugin waits for netifd to bring the port down or up after the reload.
+ROLLBACK_S = 30
+VERIFY_S = 15
+VERIFY_PAUSE_S = 1.0
+
+WRITE_ACL = (
+    'it needs "write": {"ubus": {"uci": ["set", "add", "delete", "revert", "apply", '
+    '"confirm", "rollback"]}, "uci": ["network"]} in its ACL file and '
+    "`list write 'omini'` in its login (see the plugin's README)"
+)
+
+
+def _write(c: Client, method: str, args: dict[str, Any]) -> Any:
+    """A uci call that changes the configuration; a refusal names the ACL."""
+    try:
+        return c.call("uci", method, args)
+    except AccessDenied as e:
+        raise PluginError(
+            f"the ACL of user {c.username!r} does not allow changes (ubus uci {method}): "
+            + WRITE_ACL
+        ) from e
+    except UbusError as e:
+        raise PluginError(f"OpenWrt refused uci {method}: {e} (nothing was changed)") from e
+
+
+def port_present(c: Client, port: str) -> bool | None:
+    """Whether netifd has the port up for use (`present`): False once it is
+    disabled in the configuration. None when the answer says nothing."""
+    try:
+        st = c.call("network.device", "status", {"name": port})
+    except Unavailable:
+        return None
+    present = st.get("present") if isinstance(st, dict) else None
+    return present if isinstance(present, bool) else None
+
+
+def check_port(raw_devices: Any, config: Any, port: str) -> None:
+    """Refuses what is not a physical port of this router."""
+    if config_sections(config, "switch"):
+        raise PluginError(
+            "this router's switch uses swconfig (an older driver): its ports are not "
+            "separate devices, and the plugin cannot disable one alone"
+        )
+    devices = raw_devices if isinstance(raw_devices, dict) else {}
+    devices = {k: v for k, v in devices.items() if isinstance(v, dict)}
+    if port in disabled_ports(config):
+        return
+    st = devices.get(port)
+    if st is None:
+        raise PluginError(f"OpenWrt has no port {port}")
+    if iface_type(port, st) != "ethernet":
+        raise PluginError(f"{port} is not a physical port: only ports can be disabled")
+    if port in conduits(devices):
+        raise PluginError(
+            f"{port} is the switch's CPU port: disabling it would take down every LAN port"
+        )
+
+
+def apply(cfg: Config, change: Change) -> list[Device]:
+    """Enables or disables a port (port.enabled) the way LuCI saves a change:
+    stages `enabled '0'` on the port's `config device` section (removes it to
+    enable), applies it with rollback (rpcd saves it and reloads the network,
+    and restores the previous file by itself unless confirmed), reads the
+    port again and confirms only when netifd shows it disabled (or enabled).
+    Nothing else in the configuration is touched. Returns the router as read
+    after the change."""
+    if change.kind != "port.enabled" or not isinstance(change.value, bool):
+        raise PluginError(f"this plugin cannot apply {change.kind} = {change.value!r}")
+    port, value = change.port or "", change.value
+    c = client_from(cfg)
+    try:
+        # A session of its own: staged changes and the pending apply belong
+        # to it, and a refusal then means the ACL, not an expired session.
+        c.login()
+        r = Reader(c)
+        devices = r.required("network.device", "status")
+        try:
+            config = c.call("uci", "get", {"config": "network"})
+        except AccessDenied as e:
+            raise PluginError(
+                f"the ACL of user {c.username!r} does not allow ubus uci get on the network "
+                'config: it needs "read": {"ubus": {"uci": ["get"]}, "uci": ["network"]} '
+                "in its ACL file (see the plugin's README)"
+            ) from e
+        check_port(devices, config, port)
+        if (port not in disabled_ports(config)) == value:
+            return collect(cfg)
+
+        # Only this session's staged changes: the saved file is untouched.
+        _write(c, "revert", {"config": "network"})
+        sections = [
+            s
+            for s in config_sections(config, "device")
+            if s.get("name") == port and not s.get("type") and isinstance(s.get(".name"), str)
+        ]
+        if not value:
+            if sections:
+                for s in sections:
+                    _write(
+                        c,
+                        "set",
+                        {"config": "network", "section": s[".name"], "values": {"enabled": "0"}},
+                    )
+            else:
+                _write(
+                    c,
+                    "add",
+                    {
+                        "config": "network",
+                        "type": "device",
+                        "values": {"name": port, "enabled": "0"},
+                    },
+                )
+        else:
+            for s in sections:
+                if str(s.get("enabled", "")).strip().lower() in OFF:
+                    _write(
+                        c,
+                        "delete",
+                        {"config": "network", "section": s[".name"], "option": "enabled"},
+                    )
+
+        try:
+            c.call("uci", "apply", {"rollback": True, "timeout": ROLLBACK_S})
+        except AccessDenied as e:
+            _quietly(c, "revert", {"config": "network"})
+            raise PluginError(
+                "OpenWrt has another change waiting to be confirmed (applied from LuCI?): "
+                "nothing was changed, try again in a minute"
+            ) from e
+        except UbusError as e:
+            _quietly(c, "revert", {"config": "network"})
+            raise PluginError(f"OpenWrt did not apply the change: {e} (nothing was changed)") from e
+
+        try:
+            ok = wait_for(c, port, value)
+        except PluginError as e:
+            raise PluginError(
+                f"lost OpenWrt after changing {port}: it restores the previous configuration "
+                f"by itself in {ROLLBACK_S} s ({e})"
+            ) from e
+        if not ok:
+            _quietly(c, "rollback", {})
+            _quietly(c, "revert", {"config": "network"})
+            raise PluginError(
+                f"OpenWrt did not {'enable' if value else 'disable'} {port} "
+                "(rolled back, not saved)"
+            )
+        try:
+            c.call("uci", "confirm", {})
+        except UbusError as e:
+            raise PluginError(
+                f"could not confirm the change to {port}: OpenWrt restores the previous "
+                f"configuration in {ROLLBACK_S} s"
+            ) from e
+    finally:
+        c.close()
+    return collect(cfg)
+
+
+def wait_for(c: Client, port: str, enabled: bool) -> bool:
+    """Reads the port until netifd shows it in the new state (the network
+    reload runs a moment after `uci apply`)."""
+    deadline = time.monotonic() + VERIFY_S
+    while True:
+        if port_present(c, port) is enabled:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(VERIFY_PAUSE_S)
+
+
+def _quietly(c: Client, method: str, args: dict[str, Any]) -> None:
+    try:
+        c.call("uci", method, args)
+    except (UbusError, PluginError) as e:
+        log.warning("uci %s failed: %s", method, e)
