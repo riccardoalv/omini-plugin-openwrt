@@ -1,6 +1,6 @@
 id: openwrt
 name: OpenWrt
-version: 0.1.0
+version: 0.2.0
 protocol: 1
 entrypoint: main.py
 timeout_s: 60
@@ -8,12 +8,15 @@ description: >-
   OpenWrt routers and access points through ubus over HTTP (the API LuCI uses):
   ports with link speed, traffic and bridge VLANs, WANs, Wi-Fi networks and
   clients with signal and rates, ARP, DHCP leases, host names, memory, load,
-  disks, temperatures and uptime, and enables or disables ports (applied with
-  rollback, checked, then confirmed).
+  disks, temperatures and uptime, and enables or disables ports and manages
+  the Wi-Fi networks of each VLAN (applied with rollback, checked, then
+  confirmed).
 author: Omini
 homepage: https://github.com/riccardoalv/omini-plugin-openwrt
 changes:
   - port.enabled
+  - wifi.set
+  - wifi.delete
 fields:
   - key: url
     type: url

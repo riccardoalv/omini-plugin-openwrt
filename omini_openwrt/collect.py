@@ -27,6 +27,7 @@ from omini_sdk import (
     log,
 )
 
+from omini_openwrt import wifi as wlan
 from omini_openwrt.client import AccessDenied, Client, UbusError, Unavailable
 
 PLUGIN_ID = "openwrt"
@@ -241,6 +242,8 @@ def read_all(client: Client) -> tuple[dict[str, Any], list[str]]:
 
     # The network configuration: which ports are disabled (enabled '0').
     raw["config"] = r.optional("uci", "get", {"config": "network"}, report="uci get network")
+    # The Wi-Fi networks and their VLANs (an access point's wireless config).
+    raw["wireless"] = r.optional("uci", "get", {"config": "wireless"}, report=None)
     raw["arp"] = r.file_read("/proc/net/arp")
     raw["temps"] = read_temperatures(r)
     return raw, r.denied
@@ -498,6 +501,9 @@ def build(raw: dict[str, Any], host: str | None) -> Device:
 
     leases, hosts = map_leases_and_hosts(raw["leases"], raw["hints"])
     wireless = map_wireless(raw["wifi"])
+    extra: dict[str, Any] = {}
+    if "wifi_networks" in Device.model_fields and raw.get("wireless"):
+        extra["wifi_networks"] = wlan.wifi_networks(raw["wireless"], raw.get("config")) or None
 
     return Device(
         key=key,
@@ -521,6 +527,7 @@ def build(raw: dict[str, Any], host: str | None) -> Device:
         gateways=gateways or None,
         hosts=hosts,
         vlans=vlans or None,
+        **extra,
     )
 
 
@@ -697,7 +704,7 @@ VERIFY_PAUSE_S = 1.0
 
 WRITE_ACL = (
     'it needs "write": {"ubus": {"uci": ["set", "add", "delete", "revert", "apply", '
-    '"confirm", "rollback"]}, "uci": ["network"]} in its ACL file and '
+    '"confirm", "rollback"]}, "uci": ["network", "wireless"]} in its ACL file and '
     "`list write 'omini'` in its login (see the plugin's README)"
 )
 
@@ -756,6 +763,8 @@ def apply(cfg: Config, change: Change) -> list[Device]:
     port again and confirms only when netifd shows it disabled (or enabled).
     Nothing else in the configuration is touched. Returns the router as read
     after the change."""
+    if change.kind in ("wifi.set", "wifi.delete"):
+        return apply_wifi(cfg, change)
     if change.kind != "port.enabled" or not isinstance(change.value, bool):
         raise PluginError(f"this plugin cannot apply {change.kind} = {change.value!r}")
     port, value = change.port or "", change.value
@@ -848,6 +857,111 @@ def apply(cfg: Config, change: Change) -> list[Device]:
     finally:
         c.close()
     return collect(cfg)
+
+
+def apply_wifi(cfg: Config, change: Change) -> list[Device]:
+    """wifi.set: a Wi-Fi network on every radio of the router (its name, the
+    VLAN's interface, the password, on or off); wifi.delete removes it. Staged
+    in this session, applied with rollback, read again, then confirmed — as
+    LuCI saves a change."""
+    value = change.value if isinstance(change.value, dict) else {}
+    ssid = str(value.get("ssid") or "")
+    c = client_from(cfg)
+    try:
+        c.login()
+        try:
+            wireless = c.call("uci", "get", {"config": "wireless"})
+            network = c.call("uci", "get", {"config": "network"})
+        except AccessDenied as e:
+            raise PluginError(
+                f"the ACL of user {c.username!r} does not allow reading the wireless config: "
+                + WRITE_ACL
+            ) from e
+        for config in ("wireless", "network"):
+            _write(c, "revert", {"config": config})
+        aps = [
+            s
+            for s in wlan.sections(wireless, "wifi-iface")
+            if s.get("mode", "ap") == "ap" and s.get("ssid") in (ssid, value.get("previous"))
+        ]
+        if change.kind == "wifi.delete":
+            if not aps:
+                raise PluginError(f'the router has no Wi-Fi network "{ssid}"')
+            for s in aps:
+                _write(c, "delete", {"config": "wireless", "section": s[".name"]})
+        else:
+            stage_wifi(c, wireless, network, value, aps)
+        try:
+            c.call("uci", "apply", {"rollback": True, "timeout": ROLLBACK_S})
+        except (AccessDenied, UbusError) as e:
+            for config in ("wireless", "network"):
+                _quietly(c, "revert", {"config": config})
+            raise PluginError(
+                f"OpenWrt did not apply the Wi-Fi change: {e} (nothing was changed)"
+            ) from e
+        after = wlan.wifi_networks(
+            c.call("uci", "get", {"config": "wireless"}),
+            c.call("uci", "get", {"config": "network"}),
+        )
+        got = next((w for w in after if w["ssid"] == ssid), None)
+        ok = got is None if change.kind == "wifi.delete" else got is not None
+        if not ok:
+            _quietly(c, "rollback", {})
+            raise PluginError("OpenWrt did not apply the Wi-Fi change (rolled back, not saved)")
+        try:
+            c.call("uci", "confirm", {})
+        except UbusError as e:
+            raise PluginError(
+                f"could not confirm the Wi-Fi change: OpenWrt restores the previous "
+                f"configuration in {ROLLBACK_S} s"
+            ) from e
+    finally:
+        c.close()
+    return collect(cfg)
+
+
+def stage_wifi(
+    c: Client, wireless: Any, network: Any, value: dict[str, Any], aps: list[dict[str, Any]]
+) -> None:
+    """The uci writes of a wifi.set: the VLAN's interface when missing, then
+    each radio's access point."""
+    iface = None
+    if value.get("vlan") is not None or not aps:
+        iface, writes = wlan.plan_interface(network, int(value.get("vlan") or 1))
+        for kind, values in writes:
+            name = values.pop("name", None)
+            args: dict[str, Any] = {"config": "network", "type": kind, "values": values}
+            if name:
+                args["name"] = name
+            _write(c, "add", args)
+    options: dict[str, Any] = {"ssid": str(value["ssid"])}
+    if iface:
+        options["network"] = iface
+    if value.get("password"):
+        options["key"] = str(value["password"])
+    if value.get("enabled") is not None:
+        options["disabled"] = "0" if value["enabled"] else "1"
+    if aps:
+        for s in aps:
+            if value.get("password") and str(s.get("encryption") or "none") in ("none", "owe"):
+                options["encryption"] = "psk2"
+            _write(c, "set", {"config": "wireless", "section": s[".name"], "values": options})
+        return
+    if not value.get("password"):
+        raise PluginError("a new Wi-Fi network needs a password")
+    radios = wlan.sections(wireless, "wifi-device")
+    if not radios:
+        raise PluginError("the router has no Wi-Fi radio")
+    for r in radios:
+        _write(
+            c,
+            "add",
+            {
+                "config": "wireless",
+                "type": "wifi-iface",
+                "values": {"device": r[".name"], "mode": "ap", "encryption": "psk2", **options},
+            },
+        )
 
 
 def wait_for(c: Client, port: str, enabled: bool) -> bool:

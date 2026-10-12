@@ -36,6 +36,11 @@ class AccessDenied(UbusError):
     """The session's ACL does not allow this method (or the session expired)."""
 
 
+class NotPermitted(AccessDenied):
+    """A live session whose ACL does not allow this (rpcd's permission denied
+    status): logging in again would not change it."""
+
+
 class Unavailable(UbusError):
     """The object or method does not exist, or it answered an error status."""
 
@@ -135,8 +140,8 @@ class Client:
         assert self.session is not None
         try:
             return self._rpc(self.session, obj, method, args or {})
-        except AccessDenied:
-            if self.fresh:
+        except AccessDenied as e:
+            if self.fresh or isinstance(e, NotPermitted):
                 raise
             self.login()
             return self._rpc(self.session, obj, method, args or {})
@@ -184,7 +189,7 @@ class Client:
         if not isinstance(result, list) or not result:
             raise PluginError(f"{self.base} did not answer like ubus")
         if result[0] == STATUS_PERMISSION_DENIED:
-            raise AccessDenied(f"{obj} {method}")
+            raise NotPermitted(f"{obj} {method}")
         if result[0] != 0:
             raise Unavailable(f"{obj} {method}: status {result[0]}")
         return result[1] if len(result) > 1 else {}

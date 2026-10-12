@@ -35,6 +35,8 @@ Every method but `system board` is optional: when the ACL refuses it, or the dev
 
 A disabled port is down for netifd (it leaves it out of the bridge), stays down after a reboot, and appears as **Disabled** on the map. The plugin refuses the switch's CPU port (`eth0` on most routers, which carries every LAN port), bridges, VLANs and Wi-Fi interfaces, and routers whose switch uses **swconfig** (older devices with `config switch` sections), where ports are not separate devices.
 
+**Wi-Fi per VLAN** (`wifi.set`, `wifi.delete`) works the same way on `/etc/config/wireless`: the access point of each radio is added, changed (name, network, password, on or off) or deleted, applied with rollback, read again and confirmed. A VLAN with no interface on the router gets one (a `bridge-vlan` tagged on the ports VLAN 1 has, and an unmanaged interface on it) only when the bridge already filters VLANs; otherwise the plugin asks to turn bridge VLAN filtering on in LuCI first. The password is written to the router only.
+
 If another change applied from LuCI is still waiting to be confirmed, the plugin changes nothing and asks to try again. Collecting only reads: it never calls a uci method other than `uci get`.
 
 ## Requirements
@@ -62,7 +64,7 @@ rpcd logins are not system users: each is an entry in `/etc/config/rpcd` that ma
            "file": ["read", "list"],
            "uci": ["get"]
          },
-         "uci": ["network"],
+         "uci": ["network", "wireless"],
          "file": {
            "/proc/net/arp": ["read"],
            "/sys/class/thermal": ["list"],
@@ -74,13 +76,13 @@ rpcd logins are not system users: each is an entry in `/etc/config/rpcd` that ma
          "ubus": {
            "uci": ["set", "add", "delete", "revert", "apply", "confirm", "rollback"]
          },
-         "uci": ["network"]
+         "uci": ["network", "wireless"]
        }
      }
    }
    ```
 
-   The `uci` lists limit the uci methods to `/etc/config/network`: Omini cannot read or change any other configuration (wireless, firewall, passwords...). The `file` section limits `file read` / `file list` to those exact paths: Omini cannot read any other file. Leave out the `file` entries (both the ubus methods and the paths) if you do not want ARP and temperatures.
+   The `uci` lists limit the uci methods to `/etc/config/network` and `/etc/config/wireless` (the Wi-Fi networks Omini manages per VLAN; leave `wireless` out if it should not): Omini cannot read or change any other configuration (firewall, passwords...). The `file` section limits `file read` / `file list` to those exact paths: Omini cannot read any other file. Leave out the `file` entries (both the ubus methods and the paths) if you do not want ARP and temperatures.
 
    **Read-only instead:** leave out the `"write"` block (and the `list write` line below). The map works the same; enabling or disabling a port then fails with a message naming the ACL entries it needs.
 

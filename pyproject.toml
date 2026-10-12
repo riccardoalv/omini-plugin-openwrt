@@ -2,7 +2,7 @@
 # own copy of omini-sdk to the plugin's environment.
 [project]
 name = "omini-plugin-openwrt"
-version = "0.1.0"
+version = "0.2.0"
 description = "Omini plugin for OpenWrt"
 license = "MIT"
 requires-python = ">=3.10"
