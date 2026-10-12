@@ -3,11 +3,15 @@
 - DNS: dnsmasq's `config domain` sections in /etc/config/dhcp (`name`, `ip`:
   dnsmasq answers that name, and names under it, with the address); the local
   domain is the dnsmasq section's `domain` option.
-- Pause: an fw4 ipset `omini_paused` in /etc/config/firewall (`list entry`
-  with the paused IPv4 addresses, `list omini` with "<mac> <ip>,<ip> <name>"
-  so the MAC behind each address is kept) and, on every zone but the WAN's, a
-  rule "Omini pause" rejecting that set towards the WAN zone (the internet;
-  the device's own and other local networks stay reachable).
+- Pause: by MAC, so both IPv4 and IPv6 (whatever addresses the device takes,
+  IPv6 temporary ones included): on every zone but the WAN's, one fw4 rule
+  "Omini pause" (`list src_mac` with every paused MAC, `family any`, `proto
+  all`, target REJECT) towards the WAN zone. Going to the WAN zone is the
+  internet, so the device's own and other local networks (IPv4 and IPv6)
+  stay reachable. Each rule also keeps `list omini` "<mac> <ip>,<ip> <name>"
+  (an option fw4 ignores) so collect reports the addresses Omini paused. The
+  0.3.0 shape (an ipset `omini_paused` of IPv4 addresses and rules matching
+  it) is still read, and replaced on the next pause or resume.
 
 Everything here plans uci calls (or reads); collect.apply stages, applies
 (with rollback), verifies and confirms them."""
@@ -24,9 +28,9 @@ from omini_openwrt.networks import add, delete, norm_mac, setv, wan_zone
 from omini_openwrt.vlans import Op, as_list
 from omini_openwrt.wifi import sections
 
-PAUSE_SET = "omini_paused"
+PAUSE_SET = "omini_paused"  # the 0.3.0 ipset (migrated)
 PAUSE_RULE = "Omini pause"
-# The ipset's option keeping which MAC each address belongs to (fw4 ignores it).
+# The rules' option keeping each paused MAC's addresses and name (fw4 ignores it).
 PAUSE_MAP = "omini"
 HOSTNAME = re.compile(
     r"^(?=.{1,253}$)[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?(\.[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?)*$"
@@ -103,11 +107,12 @@ def has_dns(dhcp: Any, name: str, ip: str | None) -> bool:
 # --- pause --------------------------------------------------------------------
 
 
-def pause_section(firewall: Any) -> dict[str, Any] | None:
+def old_set(firewall: Any) -> dict[str, Any] | None:
+    """The ipset of version 0.3.0 (IPv4 addresses only), migrated on the next change."""
     return next((s for s in sections(firewall, "ipset") if s.get("name") == PAUSE_SET), None)
 
 
-def pause_rules(firewall: Any) -> list[dict[str, Any]]:
+def old_rules(firewall: Any) -> list[dict[str, Any]]:
     return [
         r
         for r in sections(firewall, "rule")
@@ -115,23 +120,48 @@ def pause_rules(firewall: Any) -> list[dict[str, Any]]:
     ]
 
 
-def paused(firewall: Any) -> list[dict[str, Any]] | None:
-    """The paused devices, from the ipset's "<mac> <ips> <name>" entries; None
-    without the ipset. Only addresses the set really holds are reported."""
-    s = pause_section(firewall)
-    if s is None:
+def pause_rules(firewall: Any) -> list[dict[str, Any]]:
+    """Omini's rules by MAC (one per LAN zone)."""
+    return [
+        r for r in sections(firewall, "rule") if r.get("name") == PAUSE_RULE and not r.get("ipset")
+    ]
+
+
+def parse_line(line: str) -> tuple[str, list[str], str] | None:
+    """'<mac> <ip>,<ip> <name>' → (mac, ips, name)."""
+    parts = line.split(" ", 2)
+    mac = norm_mac(parts[0])
+    if not mac:
         return None
-    held = set(as_list(s.get("entry")))
-    out = []
-    for line in as_list_lines(s.get(PAUSE_MAP)):
-        parts = line.split(" ", 2)
-        mac = norm_mac(parts[0])
-        if not mac:
-            continue
-        ips = [ip for ip in (parts[1].split(",") if len(parts) > 1 else []) if ip in held]
-        name = parts[2].strip() if len(parts) > 2 else ""
-        out.append({"mac": mac, "ips": ips or None, "name": name or None})
-    return sorted(out, key=lambda p: p["mac"])
+    ips = [ip for ip in (parts[1].split(",") if len(parts) > 1 else []) if ip]
+    return mac, ips, parts[2].strip() if len(parts) > 2 else ""
+
+
+def paused(firewall: Any) -> list[dict[str, Any]] | None:
+    """The paused devices: the MACs the "Omini pause" rules match, with the
+    addresses and name their `omini` lines keep; and those of a 0.3.0 ipset
+    (its addresses that the set really holds). None without either."""
+    rules, s = pause_rules(firewall), old_set(firewall)
+    if not rules and s is None:
+        return None
+    found: dict[str, dict[str, Any]] = {}
+    for r in rules:
+        macs = {norm_mac(m) for m in as_list(r.get("src_mac"))}
+        for line in as_list_lines(r.get(PAUSE_MAP)):
+            parsed = parse_line(line)
+            if parsed and parsed[0] in macs:
+                found.setdefault(parsed[0], {"mac": parsed[0], "ips": parsed[1], "name": parsed[2]})
+    if s is not None:
+        held = set(as_list(s.get("entry")))
+        for line in as_list_lines(s.get(PAUSE_MAP)):
+            parsed = parse_line(line)
+            if parsed:
+                ips = [ip for ip in parsed[1] if ip in held]
+                found.setdefault(parsed[0], {"mac": parsed[0], "ips": ips, "name": parsed[2]})
+    return [
+        {"mac": p["mac"], "ips": p["ips"] or None, "name": p["name"] or None}
+        for p in sorted(found.values(), key=lambda p: p["mac"])
+    ]
 
 
 def as_list_lines(value: Any) -> list[str]:
@@ -149,51 +179,41 @@ def lan_zones(firewall: Any, wans: set[str]) -> list[str]:
 def _pause_writes(
     firewall: Any, devices: dict[str, tuple[list[str], str]], wans: set[str]
 ) -> list[Op]:
-    """The ipset and the rules for exactly `devices` (mac → (ips, name)); with
-    none, both are removed."""
-    s = pause_section(firewall)
+    """The rules for exactly `devices` (mac → (ips, name)); with none, they
+    are removed. A 0.3.0 ipset and its rules always go (migrated)."""
+    ops = [delete("firewall", r[".name"]) for r in old_rules(firewall)]
+    s = old_set(firewall)
+    if s is not None:
+        ops.append(delete("firewall", s[".name"]))
     rules = pause_rules(firewall)
     if not devices:
-        ops = [delete("firewall", r[".name"]) for r in rules]
-        if s is not None:
-            ops.append(delete("firewall", s[".name"]))
-        return ops
-    entries = sorted({ip for ips, _ in devices.values() for ip in ips}, key=ipaddress.IPv4Address)
+        return ops + [delete("firewall", r[".name"]) for r in rules]
+    macs = sorted(devices)
     lines = [
         " ".join(x for x in (mac, ",".join(ips), name) if x)
         for mac, (ips, name) in sorted(devices.items())
     ]
-    values = {"entry": entries, PAUSE_MAP: lines}
-    ops: list[Op] = []
-    if s is None:
-        ops.append(
-            add(
-                "firewall",
-                "ipset",
-                {"name": PAUSE_SET, "family": "ipv4", "match": ["src_ip"], **values},
-            )
-        )
-    else:
-        ops.append(setv("firewall", s[".name"], values))
     wan = wan_zone(firewall, wans)
-    have = {str(r.get("src")) for r in rules}
-    for zone in lan_zones(firewall, wans):
+    values = {
+        "dest": wan,
+        "src_mac": macs,
+        "proto": "all",
+        "family": "any",
+        "target": "REJECT",
+        PAUSE_MAP: lines,
+    }
+    zones = lan_zones(firewall, wans)
+    have: set[str] = set()
+    for r in rules:
+        zone = str(r.get("src"))
+        if zone in zones and zone not in have:
+            have.add(zone)
+            ops.append(setv("firewall", r[".name"], values))
+        else:  # a zone that is gone, or a duplicate
+            ops.append(delete("firewall", r[".name"]))
+    for zone in zones:
         if zone not in have:
-            ops.append(
-                add(
-                    "firewall",
-                    "rule",
-                    {
-                        "name": PAUSE_RULE,
-                        "src": zone,
-                        "dest": wan,
-                        "ipset": PAUSE_SET,
-                        "proto": "all",
-                        "family": "ipv4",
-                        "target": "REJECT",
-                    },
-                )
-            )
+            ops.append(add("firewall", "rule", {"name": PAUSE_RULE, "src": zone, **values}))
     return ops
 
 
@@ -213,7 +233,7 @@ def plan_pause_set(
         if ip and ip not in ips:
             ips.append(ip)
     if not ips:
-        raise PluginError("pausing needs the device's IPv4 address (only IPv4 is blocked)")
+        raise PluginError("pausing needs the device's IPv4 address")
     mine = sorted(set(ips) & protected)
     if mine:
         raise PluginError(f"{', '.join(mine)} is the router itself: it cannot be paused")
@@ -225,7 +245,7 @@ def plan_pause_set(
     for other, (other_ips, other_name) in list(devices.items()):
         devices[other] = ([ip for ip in other_ips if ip not in ips], other_name)
     devices[mac] = (ips, name)
-    if devices == _current(firewall) and pause_rules(firewall):
+    if devices == _current(firewall) and pause_matches(firewall, mac, ips, wans):
         return []
     return _pause_writes(firewall, devices, wans)
 
@@ -242,9 +262,23 @@ def plan_pause_delete(firewall: Any, value: dict[str, Any], wans: set[str]) -> l
 
 
 def pause_matches(firewall: Any, mac: str, ips: list[str] | None, wans: set[str]) -> bool:
-    """Whether the firewall config pauses mac on ips (None: mac not paused)."""
+    """Whether the firewall config pauses mac on ips by MAC, from every LAN
+    zone to the WAN's, in both families (None: mac not paused at all)."""
     found = {p["mac"]: p["ips"] or [] for p in paused(firewall) or []}
     if ips is None:
         return mac not in found
-    zones = {str(r.get("src")) for r in pause_rules(firewall)}
-    return sorted(found.get(mac, [])) == sorted(ips) and set(lan_zones(firewall, wans)) <= zones
+    wan = wan_zone(firewall, wans)
+    zones = {
+        str(r.get("src"))
+        for r in pause_rules(firewall)
+        if mac in {norm_mac(m) for m in as_list(r.get("src_mac"))}
+        and str(r.get("dest")) == wan
+        and str(r.get("family") or "any") == "any"
+        and str(r.get("target") or "").upper() == "REJECT"
+        and str(r.get("enabled", "1")) != "0"
+    }
+    return (
+        sorted(found.get(mac, [])) == sorted(ips)
+        and set(lan_zones(firewall, wans)) <= zones
+        and old_set(firewall) is None
+    )

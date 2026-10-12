@@ -98,17 +98,19 @@ def pause_sections(fake):
 def test_pauses_and_resumes_a_device(openwrt, cfg):
     value = {"mac": TABLET.upper(), "ips": ["192.168.1.50", "fd00::50"], "name": "Kid tablet"}
     dev = apply(cfg, change("pause.set", value))[0]
-    [ipset], [rule] = pause_sections(openwrt)
-    assert ipset["name"] == "omini_paused" and ipset["match"] == ["src_ip"]
-    assert ipset["entry"] == ["192.168.1.50"]  # IPv4 only
-    assert ipset["omini"] == [f"{TABLET} 192.168.1.50 Kid tablet"]
-    # One rule per zone but the WAN's: towards the WAN zone only (the LAN stays reachable).
-    assert {k: rule[k] for k in ("src", "dest", "ipset", "target", "family")} == {
+    [], [rule] = pause_sections(openwrt)
+    # One rule per zone but the WAN's, by MAC and for both families (whatever IPv6
+    # address the device takes), towards the WAN zone only: the local networks,
+    # IPv4 and IPv6, stay reachable.
+    assert {k: v for k, v in rule.items() if not k.startswith(".")} == {
+        "name": "Omini pause",
         "src": "lan",
         "dest": "wan",
-        "ipset": "omini_paused",
+        "src_mac": [TABLET],
+        "proto": "all",
+        "family": "any",
         "target": "REJECT",
-        "family": "ipv4",
+        "omini": [f"{TABLET} 192.168.1.50 Kid tablet"],  # the IPv4 Omini sent, kept
     }
     assert [p.model_dump(exclude_none=True) for p in dev.paused] == [
         {"mac": TABLET, "ips": ["192.168.1.50"], "name": "Kid tablet"}
@@ -118,17 +120,18 @@ def test_pauses_and_resumes_a_device(openwrt, cfg):
     # A second device, and the first one's new address (it changed IP).
     apply(cfg, change("pause.set", {"mac": "aa:bb:cc:00:00:02", "ips": ["192.168.1.60"]}))
     dev = apply(cfg, change("pause.set", {**value, "ips": ["192.168.1.51"]}))[0]
-    [ipset], rules = pause_sections(openwrt)
-    assert ipset["entry"] == ["192.168.1.51", "192.168.1.60"] and len(rules) == 1
+    [], [rule] = pause_sections(openwrt)
+    assert rule["src_mac"] == [TABLET, "aa:bb:cc:00:00:02"]
     assert {p.mac: p.ips for p in dev.paused} == {
         TABLET: ["192.168.1.51"],
         "aa:bb:cc:00:00:02": ["192.168.1.60"],
     }
 
     apply(cfg, change("pause.delete", {"mac": TABLET}))
-    [ipset], _ = pause_sections(openwrt)
-    assert ipset["entry"] == ["192.168.1.60"]
-    # The last one resumed: the set and the rules go away.
+    [], [rule] = pause_sections(openwrt)
+    assert rule["src_mac"] == ["aa:bb:cc:00:00:02"]
+    assert rule["omini"] == ["aa:bb:cc:00:00:02 192.168.1.60"]
+    # The last one resumed: the rules go away.
     dev = apply(cfg, change("pause.delete", {"mac": "aa:bb:cc:00:00:02"}))[0]
     assert pause_sections(openwrt) == ([], []) and dev.paused is None
     assert openwrt.other["firewall"] == FIREWALL
@@ -136,6 +139,67 @@ def test_pauses_and_resumes_a_device(openwrt, cfg):
     writes = len(openwrt.writes)
     apply(cfg, change("pause.delete", {"mac": TABLET}))
     assert len(openwrt.writes) == writes
+
+
+def old_pause(fake, *devices):
+    """The 0.3.0 shape: an ipset of IPv4 addresses and a rule matching it."""
+    values = fake.other["firewall"]["values"]
+    entries = sorted(ip for _, ips, _ in devices for ip in ips)
+    lines = [" ".join(x for x in (mac, ",".join(ips), name) if x) for mac, ips, name in devices]
+    values["cfg0a"] = sec(
+        "cfg0a",
+        "ipset",
+        name="omini_paused",
+        family="ipv4",
+        match=["src_ip"],
+        entry=entries,
+        omini=lines,
+    )
+    values["cfg0b"] = sec(
+        "cfg0b",
+        "rule",
+        name="Omini pause",
+        src="lan",
+        dest="wan",
+        ipset="omini_paused",
+        proto="all",
+        family="ipv4",
+        target="REJECT",
+    )
+
+
+def test_a_device_paused_by_0_3_0_is_reported_and_resumes(openwrt, cfg):
+    old_pause(openwrt, (TABLET, ["192.168.1.50"], "Kid tablet"))
+    [dev] = collect(cfg)
+    assert [p.model_dump(exclude_none=True) for p in dev.paused] == [
+        {"mac": TABLET, "ips": ["192.168.1.50"], "name": "Kid tablet"}
+    ]
+    dev = apply(cfg, change("pause.delete", {"mac": TABLET}))[0]
+    assert pause_sections(openwrt) == ([], []) and dev.paused is None
+    assert openwrt.other["firewall"] == FIREWALL
+
+
+def test_the_next_pause_migrates_the_0_3_0_shape(openwrt, cfg):
+    old_pause(
+        openwrt,
+        (TABLET, ["192.168.1.50"], "Kid tablet"),
+        ("aa:bb:cc:00:00:02", ["192.168.1.60"], ""),
+    )
+    dev = apply(cfg, change("pause.set", {"mac": "aa:bb:cc:00:00:03", "ips": ["192.168.1.70"]}))[0]
+    [], [rule] = pause_sections(openwrt)  # the ipset and its rule are gone
+    assert "ipset" not in rule and rule["family"] == "any"
+    assert rule["src_mac"] == [TABLET, "aa:bb:cc:00:00:02", "aa:bb:cc:00:00:03"]
+    assert {p.mac: p.ips for p in dev.paused} == {
+        TABLET: ["192.168.1.50"],
+        "aa:bb:cc:00:00:02": ["192.168.1.60"],
+        "aa:bb:cc:00:00:03": ["192.168.1.70"],
+    }
+    # Pausing an already paused device again also migrates it.
+    openwrt.other["firewall"] = copy.deepcopy(FIREWALL)
+    old_pause(openwrt, (TABLET, ["192.168.1.50"], "Kid tablet"))
+    apply(cfg, change("pause.set", {"mac": TABLET, "ips": ["192.168.1.50"], "name": "Kid tablet"}))
+    [], [rule] = pause_sections(openwrt)
+    assert rule["src_mac"] == [TABLET]
 
 
 def test_a_rule_for_every_lan_zone(openwrt, cfg):
@@ -149,7 +213,7 @@ def test_a_rule_for_every_lan_zone(openwrt, cfg):
 def test_pause_refusals(openwrt, cfg):
     with pytest.raises(PluginError, match="is the router itself"):
         apply(cfg, change("pause.set", {"mac": TABLET, "ips": ["192.168.1.1"]}))
-    with pytest.raises(PluginError, match="IPv4 address"):
+    with pytest.raises(PluginError, match="IPv4 address"):  # Omini reports the IPv4 it paused
         apply(cfg, change("pause.set", {"mac": TABLET, "ips": ["fd00::50"]}))
     with pytest.raises(PluginError, match="MAC address"):
         apply(cfg, change("pause.set", {"mac": "nope", "ips": ["192.168.1.50"]}))

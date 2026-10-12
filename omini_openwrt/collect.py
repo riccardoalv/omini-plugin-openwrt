@@ -1303,8 +1303,8 @@ def own_ips(dump: Any) -> set[str]:
 
 def apply_services(cfg: Config, change: Change) -> list[Device]:
     """dns.set / dns.delete (`config domain` in /etc/config/dhcp) and
-    pause.set / pause.delete (the `omini_paused` ipset and its "Omini pause"
-    rules in /etc/config/firewall). Staged in this session, applied with
+    pause.set / pause.delete (the "Omini pause" rules by MAC in
+    /etc/config/firewall). Staged in this session, applied with
     rollback, read again, then confirmed."""
     value = change.value if isinstance(change.value, dict) else {}
     c = client_from(cfg)

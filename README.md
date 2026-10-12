@@ -19,7 +19,7 @@
 | Each network's DHCP range and the fixed addresses (`config dhcp`, `config host`) | `uci get` of the `dhcp` config | Networks, reservations (routers) |
 | Each network's access (its firewall zone, rules and forwardings) | `uci get` of the `firewall` config | Networks (routers) |
 | Local DNS names (`config domain`) and the local domain (dnsmasq's `domain`) | `uci get` of the `dhcp` config | DNS names |
-| Paused devices (the `omini_paused` ipset) | `uci get` of the `firewall` config | Paused devices (routers) |
+| Paused devices (the "Omini pause" rules) | `uci get` of the `firewall` config | Paused devices (routers) |
 | Bonding interfaces (`config device` type `bonding`, `proto 'bonding'`) | `uci get` of the `network` config | LAGs |
 | Host name, time zone, NTP | `uci get` of the `system` config | Backups only |
 | ARP table | `file read` of `/proc/net/arp` | Which IP and MAC are on which interface |
@@ -77,27 +77,23 @@ dnsmasq answers the names in `/etc/config/dhcp`'s `config domain` sections (`nam
 
 ### Pausing a device's internet (`pause.set`, `pause.delete`)
 
-One fw4 ipset and one rule per LAN zone in `/etc/config/firewall`:
+One fw4 rule per LAN zone in `/etc/config/firewall`, matching the paused devices by **MAC address**:
 
 ```
-config ipset
-	option name 'omini_paused'
-	option family 'ipv4'
-	list match 'src_ip'
-	list entry '192.168.1.50'
-	list omini 'aa:bb:cc:dd:ee:ff 192.168.1.50 Kid tablet'
-
 config rule
 	option name 'Omini pause'
 	option src 'lan'
 	option dest 'wan'
-	option ipset 'omini_paused'
+	list src_mac 'aa:bb:cc:dd:ee:ff'
 	option proto 'all'
-	option family 'ipv4'
+	option family 'any'
 	option target 'REJECT'
+	list omini 'aa:bb:cc:dd:ee:ff 192.168.1.50 Kid tablet'
 ```
 
-The rule goes on every zone but the WAN's, towards the WAN's zone: the paused device loses the internet and keeps its own and the other local networks. `entry` holds the paused addresses; `omini` (an option fw4 ignores) keeps which MAC and name each belongs to, which collect reports as `paused`. `pause.set` `{mac, ips, name}` for a MAC already paused replaces its addresses (an address another paused device had moves to this one); `pause.delete` `{mac}` removes them, and the last one removes the ipset and the rules. Only **IPv4** addresses are blocked, and the router's own addresses are refused. Applied with rollback, read back, then confirmed.
+The rule goes on every zone but the WAN's, towards the WAN's zone: going to the WAN zone is the internet in OpenWrt, so the paused device loses the internet over **IPv4 and IPv6** and keeps its own and the other local networks (IPv4 and IPv6: link-local, ULA and the LAN's global prefix are not the WAN zone). Matching by MAC covers every address the device takes, IPv6 temporary (privacy) addresses included, without Omini knowing them. `list src_mac` holds every paused MAC; `omini` (an option fw4 ignores) keeps the IPv4 addresses and name Omini sent for each, which collect reports as `paused`. `pause.set` `{mac, ips, name}` for a MAC already paused replaces its addresses (an address another paused device had moves to this one); `pause.delete` `{mac}` removes it, and the last one removes the rules. The router's own addresses are refused. Applied with rollback, read back, then confirmed. The same `firewall` write access as before is enough.
+
+Version 0.3.0 paused by IPv4 address only (an ipset `omini_paused` and rules matching it): such a pause is still reported and resumes, and the next `pause.set` or `pause.delete` replaces the ipset and its rules by the rules above.
 
 ### Wake-on-LAN (`wol.send`)
 
@@ -225,7 +221,7 @@ Built from documentation without hardware, so:
 - **VLANs and networks** were built from netifd's, rpcd's and fw4's documentation and source, not tested on hardware: the bridge-vlan port syntax (`lan1:u*`, `lan1:t`), `config dhcp` start/limit and fw4 rules with `dest '*'` and `dest_ip` lists are as documented. A network's name is its interface's name (OpenWrt interfaces have no description). Wi-Fi networks on a deleted network's interface are left as they are.
 - **Wi-Fi traffic** per client: iwinfo gives byte counters, not current rates, so clients carry link rates and signal but no ↓/↑ traffic.
 - A WAN that is **down** is recognized only by OpenWrt's naming convention (`wan`, `wan6`, `wanb`...) with an uplink protocol (DHCP, PPPoE, static...).
-- **Not verified on hardware** (DNS, pause, Wake-on-LAN, backups, LAGs): `rpcd`'s `file stat` needing the path's `list` permission (if your rpcd checks another one, the plugin goes on to `file exec` without the check); `file exec` answering `{code, stdout, stderr}` and status 4 for a missing program; fw4 accepting the `omini` list on an ipset (fw4 ignores options it does not know) and `list entry` with `list match 'src_ip'`; `config device` type `bonding` with `ports` and proto-bonding's `slaves` / `bonding-<interface>` device name; rpcd's `.index` on sections.
+- **Not verified on hardware** (DNS, pause, Wake-on-LAN, backups, LAGs): `rpcd`'s `file stat` needing the path's `list` permission (if your rpcd checks another one, the plugin goes on to `file exec` without the check); `file exec` answering `{code, stdout, stderr}` and status 4 for a missing program; fw4 accepting the `omini` list on a rule (fw4 ignores options it does not know) and `list src_mac` with `family any` matching routed IPv4 and IPv6 traffic in the forward chain; `config device` type `bonding` with `ports` and proto-bonding's `slaves` / `bonding-<interface>` device name; rpcd's `.index` on sections.
 - **Pausing** blocks new connections only: fw4 accepts established connections before the zone rules, and cutting them (conntrack) needs a program the ACL does not run, so a download already running goes on until it ends. A rule placed before Omini's in the file that accepts that traffic (e.g. a custom LAN-to-WAN accept) wins; the plugin cannot reorder rules.
 - The exact shape of answers may vary between OpenWrt releases; unknown or missing fields are left empty, never guessed.
 

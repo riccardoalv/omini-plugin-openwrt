@@ -112,7 +112,7 @@ wheels = [
 
 [[package]]
 name = "omini-plugin-openwrt"
-version = "0.3.0"
+version = "0.3.1"
 source = { virtual = "." }
 dependencies = [
     { name = "httpx" },
