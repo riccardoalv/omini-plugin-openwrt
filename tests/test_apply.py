@@ -123,7 +123,9 @@ def test_a_read_only_acl_names_what_it_lacks(openwrt, cfg):
         apply(cfg, change())
     msg = str(e.value)
     assert "the ACL of user 'omini' does not allow changes (ubus uci revert)" in msg
-    assert '"uci": ["network", "wireless"]' in msg and "list write 'omini'" in msg
+    assert (
+        '"uci": ["network", "wireless", "dhcp", "firewall"]' in msg and "list write 'omini'" in msg
+    )
     # ... or they are, but the login has no write access to the network config.
     openwrt.denied.clear()
     openwrt.uci_write_denied = True

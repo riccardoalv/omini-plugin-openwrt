@@ -1,6 +1,6 @@
 id: openwrt
 name: OpenWrt
-version: 0.2.0
+version: 0.3.0
 protocol: 1
 entrypoint: main.py
 timeout_s: 60
@@ -8,13 +8,22 @@ description: >-
   OpenWrt routers and access points through ubus over HTTP (the API LuCI uses):
   ports with link speed, traffic and bridge VLANs, WANs, Wi-Fi networks and
   clients with signal and rates, ARP, DHCP leases, host names, memory, load,
-  disks, temperatures and uptime, and enables or disables ports and manages
-  the Wi-Fi networks of each VLAN (applied with rollback, checked, then
-  confirmed).
+  disks, temperatures and uptime, and each VLAN's network (interface, DHCP
+  range, firewall access, fixed addresses). It enables or disables ports,
+  changes the ports' VLANs (bridge VLAN filtering), creates and deletes VLANs
+  and their networks, sets fixed addresses and manages the Wi-Fi networks of
+  each VLAN (applied with rollback, checked, then confirmed).
 author: Omini
 homepage: https://github.com/riccardoalv/omini-plugin-openwrt
 changes:
   - port.enabled
+  - port.vlans
+  - vlan.set
+  - vlan.delete
+  - network.set
+  - network.delete
+  - reservation.set
+  - reservation.delete
   - wifi.set
   - wifi.delete
 fields:
@@ -30,8 +39,8 @@ fields:
     default: omini
     help: >-
       An rpcd login created for Omini (see the plugin's README for the exact
-      files): it reads the router and may change only the network
-      configuration. Using root works too, but is not recommended.
+      files): it reads the router and may change only the network, wireless,
+      DHCP and firewall configurations. Using root works too, but is not recommended.
   - key: password
     type: secret
     label: Password

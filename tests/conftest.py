@@ -50,6 +50,95 @@ NETWORK = {
 }
 
 
+def sec(section, kind, anonymous=True, **options):
+    return {".anonymous": anonymous, ".type": kind, ".name": section, **options}
+
+
+# /etc/config/dhcp and /etc/config/firewall as OpenWrt installs them.
+DHCP = {
+    "values": {
+        "cfg01411c": sec("cfg01411c", "dnsmasq", domain="lan", local="/lan/"),
+        "lan": sec(
+            "lan", "dhcp", False, interface="lan", start="100", limit="150", leasetime="12h"
+        ),
+        "wan": sec("wan", "dhcp", False, interface="wan", ignore="1"),
+    }
+}
+FIREWALL = {
+    "values": {
+        "cfg01e63d": sec(
+            "cfg01e63d", "defaults", input="REJECT", output="ACCEPT", forward="REJECT"
+        ),
+        "cfg02dc81": sec(
+            "cfg02dc81",
+            "zone",
+            name="lan",
+            network=["lan"],
+            input="ACCEPT",
+            output="ACCEPT",
+            forward="ACCEPT",
+        ),
+        "cfg03dc81": sec(
+            "cfg03dc81",
+            "zone",
+            name="wan",
+            network=["wan", "wan6"],
+            input="REJECT",
+            output="ACCEPT",
+            forward="REJECT",
+            masq="1",
+            mtu_fix="1",
+        ),
+        "cfg04ad58": sec("cfg04ad58", "forwarding", src="lan", dest="wan"),
+        "cfg0592bd": sec(
+            "cfg0592bd",
+            "rule",
+            name="Allow-DHCP-Renew",
+            src="wan",
+            proto="udp",
+            dest_port="68",
+            target="ACCEPT",
+            family="ipv4",
+        ),
+        "cfg0692bd": sec(
+            "cfg0692bd",
+            "rule",
+            name="Allow-Ping",
+            src="wan",
+            proto="icmp",
+            icmp_type="echo-request",
+            family="ipv4",
+            target="ACCEPT",
+        ),
+    }
+}
+
+
+def netifd_vlans(network: dict) -> dict[str, list]:
+    """What netifd shows of the bridge-vlan sections ("bridge-vlans" of each
+    bridge): "lan1" untagged, "lan1:t" tagged, "*" the PVID."""
+    out: dict[str, list] = {}
+    for s in network["values"].values():
+        if s[".type"] != "bridge-vlan":
+            continue
+        ports = s.get("ports") or []
+        ports = ports.split() if isinstance(ports, str) else ports
+        shown = []
+        for p in ports:
+            name, _, flags = p.partition(":")
+            tagged, pvid = "t" in flags, "*" in flags
+            shown.append(
+                name
+                + (":" if tagged or pvid else "")
+                + ("t" if tagged else "")
+                + ("*" if pvid else "")
+            )
+        out.setdefault(s["device"], []).append(
+            {"id": int(s["vlan"]), "local": True, "ports": shown}
+        )
+    return out
+
+
 class FakeOpenWrt:
     """Answers like OpenWrt 23.05's /ubus (uhttpd-mod-ubus + rpcd), from the
     JSON files in fixtures/ (named <object>__<method>.json)."""
@@ -67,14 +156,17 @@ class FakeOpenWrt:
         # /etc/config/network as rpcd's `uci get` answers it, the changes each
         # session staged, and a pending `uci apply` with rollback.
         self.network = copy.deepcopy(NETWORK)
-        self.staged: dict[str, dict] = {}
-        self.pending: tuple[str, dict] | None = None  # (session, the file before)
+        self.other = {"dhcp": copy.deepcopy(DHCP), "firewall": copy.deepcopy(FIREWALL)}
+        self.staged: dict[str, dict] = {}  # the network config staged by each session
+        self.staged_other: dict[str, dict[str, dict]] = {}  # dhcp and firewall
+        self.pending: tuple[str, dict, dict] | None = None  # (session, the files before)
         self.other_pending = False  # someone applied from LuCI and did not confirm yet
         self.uci_write_denied = False  # the ACL's "uci" section has no write for network
         self.ignore_changes = False  # netifd does not act on the reload
         self.confirmed = 0
         self.writes: list[tuple[str, dict]] = []  # uci calls that change something
         self.running = self.disabled_in(self.network)  # ports netifd has disabled
+        self.running_vlans = netifd_vlans(self.network)
         self.sections = 0
 
     @staticmethod
@@ -86,44 +178,66 @@ class FakeOpenWrt:
         }
 
     def uci(self, sid: str, method: str, args: dict):
-        """rpcd's uci object (the network config only): returns (status, data)."""
-        if args.get("config", "network") != "network":
+        """rpcd's uci object (network, dhcp and firewall): returns (status, data)."""
+        config = args.get("config", "network")
+        if method in ("get", "set", "add", "delete", "revert") and (
+            config not in ("network", *self.other)
+        ):
             return 6, None
-        work = self.staged.get(sid, self.network)
+        if config == "network":
+            work = self.staged.get(sid, self.network)
+        else:
+            work = self.staged_other.get(sid, {}).get(config, self.other.get(config))
         if method == "get":
             return 0, {"values": copy.deepcopy(work)["values"]}
         if method in ("set", "add", "delete", "revert") and self.uci_write_denied:
             return 6, None
         if method in ("set", "add", "delete"):
             self.writes.append((method, args))
-            work = self.staged.setdefault(sid, copy.deepcopy(self.network))
+            if config == "network":
+                work = self.staged.setdefault(sid, copy.deepcopy(self.network))
+            else:
+                mine = self.staged_other.setdefault(sid, {})
+                work = mine.setdefault(config, copy.deepcopy(self.other[config]))
             values = work["values"]
             if method == "add":
                 self.sections += 1
-                name = f"cfg{self.sections:02x}0f15"
-                values[name] = {".anonymous": True, ".type": args["type"], ".name": name}
-                values[name].update(args.get("values") or {})
+                name = args.get("name") or f"cfg{self.sections:02x}0f15"
+                values[name] = {
+                    ".anonymous": "name" not in args,
+                    ".type": args["type"],
+                    ".name": name,
+                }
+                values[name].update(copy.deepcopy(args.get("values") or {}))
                 return 0, {"section": name}
             section = values.get(args["section"])
             if section is None:
                 return 4, None
             if method == "set":
-                section.update(args["values"])
-            else:
+                section.update(copy.deepcopy(args["values"]))
+            elif "option" in args:
                 section.pop(args["option"], None)
+            else:
+                del values[args["section"]]
             return 0, None
         if method == "revert":
-            self.staged.pop(sid, None)
+            if config == "network":
+                self.staged.pop(sid, None)
+            else:
+                self.staged_other.get(sid, {}).pop(config, None)
             return 0, None
         if method == "apply":
             if self.other_pending or (self.pending and args.get("rollback")):
                 return 6, None
-            if sid not in self.staged:
+            if sid not in self.staged and not self.staged_other.get(sid):
                 return 5, None
             self.writes.append((method, args))
-            before, self.network = self.network, self.staged.pop(sid)
+            before = (self.network, copy.deepcopy(self.other))
+            if sid in self.staged:
+                self.network = self.staged.pop(sid)
+            self.other.update(self.staged_other.pop(sid, {}))
             if args.get("rollback"):
-                self.pending = (sid, before)
+                self.pending = (sid, *before)
             self.reload()
             return 0, None
         if method == "confirm":
@@ -138,7 +252,7 @@ class FakeOpenWrt:
             if not self.pending:
                 return 5, None
             self.writes.append((method, args))
-            self.network = self.pending[1]
+            _, self.network, self.other = self.pending
             self.pending = None
             self.reload()
             return 0, None
@@ -147,13 +261,19 @@ class FakeOpenWrt:
     def reload(self):
         if not self.ignore_changes:
             self.running = self.disabled_in(self.network)
+            self.running_vlans = netifd_vlans(self.network)
 
     def device_status(self, args: dict):
         devices = {
-            k: v
+            k: copy.deepcopy(v)
             for k, v in self.routes[("network.device", "status")].items()
             if k not in self.running
         }
+        # With bridge-vlan sections in the configuration, netifd shows those.
+        if self.running_vlans:
+            for name, st in devices.items():
+                if st.get("bridge-vlans") is not None or name in self.running_vlans:
+                    st["bridge-vlans"] = self.running_vlans.get(name, [])
         name = args.get("name")
         if name is None:
             return 0, devices

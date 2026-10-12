@@ -27,6 +27,8 @@ from omini_sdk import (
     log,
 )
 
+from omini_openwrt import networks as nets
+from omini_openwrt import vlans as vl
 from omini_openwrt import wifi as wlan
 from omini_openwrt.client import AccessDenied, Client, UbusError, Unavailable
 
@@ -244,6 +246,9 @@ def read_all(client: Client) -> tuple[dict[str, Any], list[str]]:
     raw["config"] = r.optional("uci", "get", {"config": "network"}, report="uci get network")
     # The Wi-Fi networks and their VLANs (an access point's wireless config).
     raw["wireless"] = r.optional("uci", "get", {"config": "wireless"}, report=None)
+    # A router's networks: their DHCP ranges and fixed addresses, and their access.
+    raw["dhcp"] = r.optional("uci", "get", {"config": "dhcp"}, report="uci get dhcp")
+    raw["firewall"] = r.optional("uci", "get", {"config": "firewall"}, report="uci get firewall")
     raw["arp"] = r.file_read("/proc/net/arp")
     raw["temps"] = read_temperatures(r)
     return raw, r.denied
@@ -470,12 +475,13 @@ def build(raw: dict[str, Any], host: str | None) -> Device:
         )
 
     vlans = []
+    vlan_names = vl.names(raw.get("config"))
     for bridge, vid in sorted(set(vlan_list), key=lambda v: (v[1], v[0])):
         dev = f"{bridge}.{vid}"
         vlans.append(
             Vlan(
                 id=vid,
-                name=", ".join(names_on.get(dev, [])) or None,
+                name=vlan_names.get(vid) or ", ".join(names_on.get(dev, [])) or None,
                 interface=dev if dev in devices or dev in names_on else None,
                 subnet=subnet_of(ips_on.get(dev, [])),
             )
@@ -504,6 +510,8 @@ def build(raw: dict[str, Any], host: str | None) -> Device:
     extra: dict[str, Any] = {}
     if "wifi_networks" in Device.model_fields and raw.get("wireless"):
         extra["wifi_networks"] = wlan.wifi_networks(raw["wireless"], raw.get("config")) or None
+    if gateways and raw.get("config"):
+        extra.update(router_networks(raw, wan_names(raw["interfaces"])))
 
     return Device(
         key=key,
@@ -529,6 +537,37 @@ def build(raw: dict[str, Any], host: str | None) -> Device:
         vlans=vlans or None,
         **extra,
     )
+
+
+def wan_names(dump: Any) -> set[str]:
+    """The WANs' logical interfaces and their devices: a default route, or a
+    wan* uplink that is down."""
+    logical = dump.get("interface") if isinstance(dump, dict) else None
+    out: set[str] = set()
+    for li in logical or []:
+        if not isinstance(li, dict):
+            continue
+        name = str(li.get("interface") or "")
+        routes = [r for r in li.get("route") or [] if isinstance(r, dict) and is_default_route(r)]
+        down = (
+            li.get("up") is not True
+            and name.startswith("wan")
+            and str(li.get("proto")) in UPLINK_PROTOS
+        )
+        if routes or down:
+            out.add(name)
+            out |= {d for d in (li.get("l3_device"), li.get("device")) if isinstance(d, str)}
+    return out
+
+
+def router_networks(raw: dict[str, Any], wans: set[str]) -> dict[str, Any]:
+    """Each VLAN's network (interface, gateway, DHCP, access) and the DHCP's
+    fixed addresses, from the network, dhcp and firewall configs."""
+    found = nets.networks(raw["config"], raw.get("dhcp"), raw.get("firewall"), wans)
+    out: dict[str, Any] = {"networks": found or None}
+    if raw.get("dhcp"):
+        out["dhcp_reservations"] = nets.reservations(raw["dhcp"]) or None
+    return out
 
 
 def pct_used(total: Any, free: Any) -> float | None:
@@ -704,8 +743,8 @@ VERIFY_PAUSE_S = 1.0
 
 WRITE_ACL = (
     'it needs "write": {"ubus": {"uci": ["set", "add", "delete", "revert", "apply", '
-    '"confirm", "rollback"]}, "uci": ["network", "wireless"]} in its ACL file and '
-    "`list write 'omini'` in its login (see the plugin's README)"
+    '"confirm", "rollback"]}, "uci": ["network", "wireless", "dhcp", "firewall"]} in its '
+    "ACL file and `list write 'omini'` in its login (see the plugin's README)"
 )
 
 
@@ -765,6 +804,10 @@ def apply(cfg: Config, change: Change) -> list[Device]:
     after the change."""
     if change.kind in ("wifi.set", "wifi.delete"):
         return apply_wifi(cfg, change)
+    if change.kind in ("port.vlans", "vlan.set", "vlan.delete"):
+        return apply_vlans(cfg, change)
+    if change.kind in ("network.set", "network.delete", "reservation.set", "reservation.delete"):
+        return apply_networks(cfg, change)
     if change.kind != "port.enabled" or not isinstance(change.value, bool):
         raise PluginError(f"this plugin cannot apply {change.kind} = {change.value!r}")
     port, value = change.port or "", change.value
@@ -981,3 +1024,199 @@ def _quietly(c: Client, method: str, args: dict[str, Any]) -> None:
         c.call("uci", method, args)
     except (UbusError, PluginError) as e:
         log.warning("uci %s failed: %s", method, e)
+
+
+# --- VLANs and networks -------------------------------------------------------
+
+
+def read_configs(c: Client, names: list[str]) -> dict[str, Any]:
+    """`uci get` of whole configs; a refusal names the ACL entries."""
+    out = {}
+    for name in names:
+        try:
+            out[name] = c.call("uci", "get", {"config": name})
+        except AccessDenied as e:
+            raise PluginError(
+                f"the ACL of user {c.username!r} does not allow reading the {name} config: "
+                + WRITE_ACL
+            ) from e
+        except UbusError as e:
+            raise PluginError(f"OpenWrt did not answer uci get {name}: {e}") from e
+    return out
+
+
+def wait_until(check: Any) -> bool:
+    """Calls check until it holds (the reload runs a moment after `uci
+    apply`); an error answer counts as not yet. Losing the router raises."""
+    deadline = time.monotonic() + VERIFY_S
+    while True:
+        try:
+            if check():
+                return True
+        except UbusError as e:
+            log.debug("not yet: %s", e)
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(VERIFY_PAUSE_S)
+
+
+def commit(
+    c: Client, configs: list[str], ops: list[tuple[str, dict[str, Any]]], done: Any, what: str
+) -> None:
+    """Stages ops in this session, applies them with rollback, waits until
+    done() holds and only then confirms; else rolls back (or, when the router
+    stopped answering, lets rpcd restore the previous files by itself)."""
+    for name in configs:
+        _write(c, "revert", {"config": name})
+    for method, args in ops:
+        _write(c, method, args)
+    try:
+        c.call("uci", "apply", {"rollback": True, "timeout": ROLLBACK_S})
+    except AccessDenied as e:
+        for name in configs:
+            _quietly(c, "revert", {"config": name})
+        raise PluginError(
+            "OpenWrt has another change waiting to be confirmed (applied from LuCI?): "
+            "nothing was changed, try again in a minute"
+        ) from e
+    except UbusError as e:
+        for name in configs:
+            _quietly(c, "revert", {"config": name})
+        raise PluginError(f"OpenWrt did not apply {what}: {e} (nothing was changed)") from e
+    try:
+        ok = wait_until(done)
+    except PluginError as e:
+        raise PluginError(
+            f"lost OpenWrt after changing {what}: it restores the previous configuration "
+            f"by itself in {ROLLBACK_S} s ({e})"
+        ) from e
+    if not ok:
+        _quietly(c, "rollback", {})
+        for name in configs:
+            _quietly(c, "revert", {"config": name})
+        raise PluginError(f"OpenWrt did not apply {what} (rolled back, not saved)")
+    try:
+        c.call("uci", "confirm", {})
+    except UbusError as e:
+        raise PluginError(
+            f"could not confirm {what}: OpenWrt restores the previous configuration "
+            f"in {ROLLBACK_S} s"
+        ) from e
+
+
+def tags(pv: PortVlans | None) -> tuple[int | None, list[int]]:
+    if pv is None:
+        return None, []
+    return pv.untagged, sorted(int(getattr(t, "root", t)) for t in pv.tagged or [])
+
+
+def running_vlans(c: Client) -> list[tuple[str, int]]:
+    status = c.call("network.device", "status")
+    return bridge_vlans(status if isinstance(status, dict) else {})[1]
+
+
+def apply_vlans(cfg: Config, change: Change) -> list[Device]:
+    """port.vlans, vlan.set and vlan.delete on a bridge that filters VLANs
+    (DSA): the `config bridge-vlan` sections of /etc/config/network, applied
+    with rollback, checked in netifd's bridge VLANs, then confirmed."""
+    value = change.value if isinstance(change.value, dict) else {}
+    c = client_from(cfg)
+    try:
+        c.login()
+        devices = Reader(c).required("network.device", "status")
+        network = read_configs(c, ["network"])["network"]
+        if vl.sections(network, "switch"):
+            raise PluginError(
+                "this router's switch uses swconfig (an older driver): its VLANs are not "
+                "changed by the plugin"
+            )
+        if change.kind == "port.vlans":
+            port = change.port or ""
+            check_port(devices, network, port)
+            untagged = int(value["untagged"]) if value.get("untagged") else None
+            tagged = sorted({int(t) for t in value.get("tagged") or []} - {untagged})
+            ops = vl.plan_port(network, port, untagged, tagged)
+            what = f"the VLANs of {port}"
+
+            def done() -> bool:
+                status = c.call("network.device", "status")
+                got = bridge_vlans(status if isinstance(status, dict) else {})[0].get(port)
+                return tags(got) == (untagged, tagged)
+
+        elif change.kind == "vlan.set":
+            vid, name = int(value["id"]), str(value.get("name") or "").strip()
+            bridge, ops = vl.plan_set(network, vid, name)
+            what = f"VLAN {vid}"
+
+            def done() -> bool:
+                saved = vl.names(c.call("uci", "get", {"config": "network"}))
+                return (bridge, vid) in running_vlans(c) and saved.get(vid, "") == name
+
+        else:
+            vid = int(value["id"])
+            ops = vl.plan_delete(network, vid)
+            what = f"VLAN {vid}"
+
+            def done() -> bool:
+                return all(v != vid for _, v in running_vlans(c))
+
+        if ops:
+            commit(c, ["network"], ops, done, what)
+    finally:
+        c.close()
+    return collect(cfg)
+
+
+def apply_networks(cfg: Config, change: Change) -> list[Device]:
+    """network.set / network.delete (the interface, its VLAN, the dhcp section
+    and the firewall zone, rules and forwarding) and reservation.set /
+    reservation.delete (`config host` in /etc/config/dhcp). Staged in this
+    session, applied with rollback, read again, then confirmed."""
+    value = change.value if isinstance(change.value, dict) else {}
+    c = client_from(cfg)
+    try:
+        c.login()
+        reservation = change.kind.startswith("reservation.")
+        names = ["dhcp"] if reservation else ["network", "dhcp", "firewall"]
+        configs = read_configs(c, names)
+        if reservation:
+            mac = nets.norm_mac(value.get("mac"))
+            if change.kind == "reservation.set":
+                ops = nets.plan_reserve(configs["dhcp"], value)
+                ip = str(value.get("ip") or "")
+
+                def done() -> bool:
+                    found = nets.reservations(read_configs(c, ["dhcp"])["dhcp"])
+                    return any(r["mac"] == mac and r["ip"] == ip for r in found)
+
+            else:
+                ops = nets.plan_unreserve(configs["dhcp"], mac)
+
+                def done() -> bool:
+                    found = nets.reservations(read_configs(c, ["dhcp"])["dhcp"])
+                    return all(r["mac"] != mac for r in found)
+
+            what = f"the reservation of {mac}"
+        else:
+            wans = wan_names(Reader(c).required("network.interface", "dump"))
+            vid = int(value.get("vlan") or 0)
+            what = f"the network of VLAN {vid}"
+            if change.kind == "network.set":
+                ops = nets.plan_set(configs, value, wans, urlparse(c.base).hostname)
+
+                def done() -> bool:
+                    return nets.matches(read_configs(c, names), value, wans)
+
+            else:
+                ops = nets.plan_delete(configs, vid, wans)
+
+                def done() -> bool:
+                    got = read_configs(c, names)
+                    found = nets.networks(got["network"], got["dhcp"], got["firewall"], wans)
+                    return all(n["vlan"] != vid for n in found)
+
+        if ops:
+            commit(c, names, ops, done, what)
+    finally:
+        c.close()
+    return collect(cfg)
