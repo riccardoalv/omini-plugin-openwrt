@@ -1,6 +1,6 @@
 # omini-plugin-openwrt
 
-[Omini](https://github.com/riccardoalv/omini) plugin for **OpenWrt** routers and access points, through **ubus over HTTP** — the JSON-RPC API LuCI itself uses. It reads the router for the map and can **enable or disable a port**, change the **ports' VLANs**, create and delete **VLANs and their networks** (interface, DHCP range, firewall access), set **fixed addresses** and manage the **Wi-Fi network of each VLAN**; it changes nothing else.
+[Omini](https://github.com/riccardoalv/omini) plugin for **OpenWrt** routers and access points, through **ubus over HTTP** — the JSON-RPC API LuCI itself uses. It reads the router for the map and can **enable or disable a port**, change the **ports' VLANs**, create and delete **VLANs and their networks** (interface, DHCP range, firewall access), set **fixed addresses**, manage the **Wi-Fi network of each VLAN**, set **local DNS names**, **pause a device's internet** and **wake a device** (Wake-on-LAN); it changes nothing else. It also makes **configuration backups** (the uci files, without secrets).
 
 > **Experimental.** This plugin was built from OpenWrt's documentation and source, not tested on real hardware yet. Reports of what works (and what does not) on your device are very welcome.
 
@@ -18,6 +18,10 @@
 | Which ports are disabled (`config device` sections with `enabled '0'`), the VLANs' names (`config bridge-vlan`), the interfaces and their addresses | `uci get` of the `network` config | Ports shown as "Disabled", VLANs, networks |
 | Each network's DHCP range and the fixed addresses (`config dhcp`, `config host`) | `uci get` of the `dhcp` config | Networks, reservations (routers) |
 | Each network's access (its firewall zone, rules and forwardings) | `uci get` of the `firewall` config | Networks (routers) |
+| Local DNS names (`config domain`) and the local domain (dnsmasq's `domain`) | `uci get` of the `dhcp` config | DNS names |
+| Paused devices (the `omini_paused` ipset) | `uci get` of the `firewall` config | Paused devices (routers) |
+| Bonding interfaces (`config device` type `bonding`, `proto 'bonding'`) | `uci get` of the `network` config | LAGs |
+| Host name, time zone, NTP | `uci get` of the `system` config | Backups only |
 | ARP table | `file read` of `/proc/net/arp` | Which IP and MAC are on which interface |
 | Temperatures (kernel thermal zones) | `file list` / `file read` under `/sys/class/thermal` | Device health (optional) |
 
@@ -67,6 +71,46 @@ A router reports one network per statically addressed, private, LAN-side interfa
 
 **Discovery between VLANs (mDNS)** is not managed: OpenWrt's reflectors (umdns, avahi) are packages set up by hand, so `mdns` on is refused with a note and off is ignored.
 
+### Local DNS names (`dns.set`, `dns.delete`)
+
+dnsmasq answers the names in `/etc/config/dhcp`'s `config domain` sections (`name`, `ip`; LuCI's *Network → DHCP and DNS → Hostnames*). `dns.set` `{name, ip}` adds `config domain` with the name and its IPv4 address, or changes the address of the one with that exact name (duplicates of the name are removed: one answer per name); `dns.delete` `{name}` removes the sections with that name. Applied with rollback, read back from the config, then confirmed. Collect reports every `config domain` with an IPv4 address as `dns_records` (A records only, lower case, names set by hand included), and the dnsmasq section's `domain` option (`lan` by default) as `dns_domain`. OpenWrt sections have no description, so Omini's names are not marked; dnsmasq also answers names *under* each name (`address=/name/ip`).
+
+### Pausing a device's internet (`pause.set`, `pause.delete`)
+
+One fw4 ipset and one rule per LAN zone in `/etc/config/firewall`:
+
+```
+config ipset
+	option name 'omini_paused'
+	option family 'ipv4'
+	list match 'src_ip'
+	list entry '192.168.1.50'
+	list omini 'aa:bb:cc:dd:ee:ff 192.168.1.50 Kid tablet'
+
+config rule
+	option name 'Omini pause'
+	option src 'lan'
+	option dest 'wan'
+	option ipset 'omini_paused'
+	option proto 'all'
+	option family 'ipv4'
+	option target 'REJECT'
+```
+
+The rule goes on every zone but the WAN's, towards the WAN's zone: the paused device loses the internet and keeps its own and the other local networks. `entry` holds the paused addresses; `omini` (an option fw4 ignores) keeps which MAC and name each belongs to, which collect reports as `paused`. `pause.set` `{mac, ips, name}` for a MAC already paused replaces its addresses (an address another paused device had moves to this one); `pause.delete` `{mac}` removes them, and the last one removes the ipset and the rules. Only **IPv4** addresses are blocked, and the router's own addresses are refused. Applied with rollback, read back, then confirmed.
+
+### Wake-on-LAN (`wol.send`)
+
+`wol.send` `{mac, ip}` runs `/usr/bin/etherwake -b -i <interface> <mac>` through rpcd's `file exec`: the magic packet is broadcast on the device (`br-lan`, `br-lan.30`...) of the router's local network that holds `ip`, or the `lan` interface's without `ip`. The plugin first checks the program with `file stat`; without it, it asks to install the `etherwake` package (`opkg install etherwake`, or `apk add etherwake` on OpenWrt 25). Nothing is changed in the configuration and nothing is verified.
+
+### Backups
+
+`backup` returns the `network`, `wireless`, `dhcp`, `firewall` and `system` configs (those the ACL lets Omini read) as one text, as `uci export` prints them, sections in the file's order (rpcd's `.index`). Options holding secrets are left out: Wi-Fi keys (`key`, `key1`-`key4`, `sae_password`), RADIUS secrets, `password` (PPPoE...), WireGuard `private_key` / `preshared_key`. There is no status, lease or counter in it, so two backups differ only when the configuration changed.
+
+### LAGs and STP (read only)
+
+Bonding interfaces are reported as LAGs: a `config device` of type `bonding` (OpenWrt 24.10's netifd, `list ports`) or a proto-bonding interface (`proto 'bonding'`, `list slaves`, device `bonding-<interface>`); the bond is `type: lag` and each member port reports `lag: <bond>`. **STP** is not reported: netifd's `network.device status` shows a bridge's `stp` setting but no per-port state or role (those are only in sysfs, `/sys/class/net/<bridge>/brif/<port>/state`).
+
 If another change applied from LuCI is still waiting to be confirmed, the plugin changes nothing and asks to try again. Collecting only reads: it never calls a uci method other than `uci get`.
 
 ## Requirements
@@ -78,7 +122,7 @@ If another change applied from LuCI is still waiting to be confirmed, the plugin
 
 rpcd logins are not system users: each is an entry in `/etc/config/rpcd` that maps a username and password to ACL groups ([ubus docs: ACLs](https://openwrt.org/docs/techref/ubus)). Over SSH on the router:
 
-1. Create the ACL file `/usr/share/rpcd/acl.d/omini.json`. It grants read access to the methods listed above, and write access **only to the `network`, `wireless`, `dhcp` and `firewall` configurations** (ports, VLANs, networks, fixed addresses and Wi-Fi):
+1. Create the ACL file `/usr/share/rpcd/acl.d/omini.json`. It grants read access to the methods listed above (and to `/etc/config/system`, for backups only), write access **only to the `network`, `wireless`, `dhcp` and `firewall` configurations** (ports, VLANs, networks, fixed addresses, Wi-Fi, DNS names and paused devices), and running **one program, `/usr/bin/etherwake`** (Wake-on-LAN):
 
    ```json
    {
@@ -94,7 +138,7 @@ rpcd logins are not system users: each is an entry in `/etc/config/rpcd` that ma
            "file": ["read", "list"],
            "uci": ["get"]
          },
-         "uci": ["network", "wireless", "dhcp", "firewall"],
+         "uci": ["network", "wireless", "dhcp", "firewall", "system"],
          "file": {
            "/proc/net/arp": ["read"],
            "/sys/class/thermal": ["list"],
@@ -104,15 +148,19 @@ rpcd logins are not system users: each is an entry in `/etc/config/rpcd` that ma
        },
        "write": {
          "ubus": {
-           "uci": ["set", "add", "delete", "revert", "apply", "confirm", "rollback"]
+           "uci": ["set", "add", "delete", "revert", "apply", "confirm", "rollback"],
+           "file": ["stat", "exec"]
          },
-         "uci": ["network", "wireless", "dhcp", "firewall"]
+         "uci": ["network", "wireless", "dhcp", "firewall"],
+         "file": {
+           "/usr/bin/etherwake": ["list", "exec"]
+         }
        }
      }
    }
    ```
 
-   The `uci` lists limit the uci methods to `/etc/config/network`, `/etc/config/wireless` (the Wi-Fi networks Omini manages per VLAN), `/etc/config/dhcp` (DHCP ranges and fixed addresses) and `/etc/config/firewall` (each network's access): Omini cannot read or change any other configuration (passwords, system, packages...). Leave `wireless`, or `dhcp` and `firewall`, out if Omini should not manage Wi-Fi, or networks (an access point needs neither `dhcp` nor `firewall`). The `file` section limits `file read` / `file list` to those exact paths: Omini cannot read any other file. Leave out the `file` entries (both the ubus methods and the paths) if you do not want ARP and temperatures.
+   The `uci` lists limit the uci methods to `/etc/config/network`, `/etc/config/wireless` (the Wi-Fi networks Omini manages per VLAN), `/etc/config/dhcp` (DHCP ranges and fixed addresses) and `/etc/config/firewall` (each network's access): Omini cannot read or change any other configuration (passwords, packages...); `system` (host name, time zone, NTP) is only read, for backups — leave it out of the `read` list if you do not want it in them. Leave `wireless`, or `dhcp` and `firewall`, out if Omini should not manage Wi-Fi, or networks (an access point needs neither `dhcp` nor `firewall`). The `file` section limits `file read` / `file list` to those exact paths: Omini cannot read any other file. Leave out the `file` entries (both the ubus methods and the paths) if you do not want ARP and temperatures. In the `write` block, `file` `stat` / `exec` with the `/usr/bin/etherwake` path is what Wake-on-LAN needs: rpcd's `file exec` checks the command against the ACL's paths, so Omini can run etherwake and nothing else (leave both out if you do not want Wake-on-LAN).
 
    **Read-only instead:** leave out the `"write"` block (and the `list write` line below). The map works the same; enabling or disabling a port then fails with a message naming the ACL entries it needs.
 
@@ -177,6 +225,8 @@ Built from documentation without hardware, so:
 - **VLANs and networks** were built from netifd's, rpcd's and fw4's documentation and source, not tested on hardware: the bridge-vlan port syntax (`lan1:u*`, `lan1:t`), `config dhcp` start/limit and fw4 rules with `dest '*'` and `dest_ip` lists are as documented. A network's name is its interface's name (OpenWrt interfaces have no description). Wi-Fi networks on a deleted network's interface are left as they are.
 - **Wi-Fi traffic** per client: iwinfo gives byte counters, not current rates, so clients carry link rates and signal but no ↓/↑ traffic.
 - A WAN that is **down** is recognized only by OpenWrt's naming convention (`wan`, `wan6`, `wanb`...) with an uplink protocol (DHCP, PPPoE, static...).
+- **Not verified on hardware** (DNS, pause, Wake-on-LAN, backups, LAGs): `rpcd`'s `file stat` needing the path's `list` permission (if your rpcd checks another one, the plugin goes on to `file exec` without the check); `file exec` answering `{code, stdout, stderr}` and status 4 for a missing program; fw4 accepting the `omini` list on an ipset (fw4 ignores options it does not know) and `list entry` with `list match 'src_ip'`; `config device` type `bonding` with `ports` and proto-bonding's `slaves` / `bonding-<interface>` device name; rpcd's `.index` on sections.
+- **Pausing** blocks new connections only: fw4 accepts established connections before the zone rules, and cutting them (conntrack) needs a program the ACL does not run, so a download already running goes on until it ends. A rule placed before Omini's in the file that accepts that traffic (e.g. a custom LAN-to-WAN accept) wins; the plugin cannot reorder rules.
 - The exact shape of answers may vary between OpenWrt releases; unknown or missing fields are left empty, never guessed.
 
 ## Development

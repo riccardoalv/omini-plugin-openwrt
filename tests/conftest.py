@@ -112,6 +112,12 @@ FIREWALL = {
         ),
     }
 }
+SYSTEM = {
+    "values": {
+        "cfg01e48a": sec("cfg01e48a", "system", hostname="OpenWrt", timezone="UTC", zonename="UTC"),
+        "ntp": sec("ntp", "timeserver", False, enabled="1", server=["0.openwrt.pool.ntp.org"]),
+    }
+}
 
 
 def netifd_vlans(network: dict) -> dict[str, list]:
@@ -157,6 +163,7 @@ class FakeOpenWrt:
         # session staged, and a pending `uci apply` with rollback.
         self.network = copy.deepcopy(NETWORK)
         self.other = {"dhcp": copy.deepcopy(DHCP), "firewall": copy.deepcopy(FIREWALL)}
+        self.system = copy.deepcopy(SYSTEM)  # /etc/config/system: read only for Omini
         self.staged: dict[str, dict] = {}  # the network config staged by each session
         self.staged_other: dict[str, dict[str, dict]] = {}  # dhcp and firewall
         self.pending: tuple[str, dict, dict] | None = None  # (session, the files before)
@@ -168,6 +175,21 @@ class FakeOpenWrt:
         self.running = self.disabled_in(self.network)  # ports netifd has disabled
         self.running_vlans = netifd_vlans(self.network)
         self.sections = 0
+        # /usr/bin/etherwake: installed, and what `file exec` ran.
+        self.etherwake = True
+        self.execs: list[dict] = []
+
+    def file_call(self, method: str, args: dict):
+        """rpcd's file stat and exec (etherwake only)."""
+        path = args.get("path") if method == "stat" else args.get("command")
+        if path != "/usr/bin/etherwake":
+            return 6, None
+        if not self.etherwake:
+            return 4, None
+        if method == "stat":
+            return 0, {"path": path, "type": "file", "size": 9000, "mode": 33261}
+        self.execs.append(args)
+        return 0, {"code": 0, "stdout": "", "stderr": ""}
 
     @staticmethod
     def disabled_in(network: dict) -> set[str]:
@@ -180,6 +202,8 @@ class FakeOpenWrt:
     def uci(self, sid: str, method: str, args: dict):
         """rpcd's uci object (network, dhcp and firewall): returns (status, data)."""
         config = args.get("config", "network")
+        if config == "system":
+            return (0, copy.deepcopy(self.system)) if method == "get" else (6, None)
         if method in ("get", "set", "add", "delete", "revert") and (
             config not in ("network", *self.other)
         ):
@@ -323,6 +347,11 @@ class FakeOpenWrt:
         if sid not in self.sessions or f"{obj} {method}" in self.denied:
             return denied()
         self.calls.append((obj, method))
+        if (obj, method) in (("file", "stat"), ("file", "exec")):
+            status, data = self.file_call(method, args)
+            if status:
+                return httpx.Response(200, json={"jsonrpc": "2.0", "id": rid, "result": [status]})
+            return ok(data)
         if obj == "uci" or (obj, method) == ("network.device", "status"):
             status, data = self.uci(sid, method, args) if obj == "uci" else self.device_status(args)
             if status:

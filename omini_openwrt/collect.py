@@ -13,11 +13,14 @@ from omini_sdk import (
     ArpEntry,
     Change,
     Config,
+    ConfigBackup,
     Device,
     DhcpLease,
+    DnsRecord,
     Gateway,
     Host,
     Interface,
+    PausedDevice,
     PluginError,
     PortVlans,
     Storage,
@@ -27,7 +30,9 @@ from omini_sdk import (
     log,
 )
 
+from omini_openwrt import backup as bk
 from omini_openwrt import networks as nets
+from omini_openwrt import services as svc
 from omini_openwrt import vlans as vl
 from omini_openwrt import wifi as wlan
 from omini_openwrt.client import AccessDenied, Client, UbusError, Unavailable
@@ -343,6 +348,22 @@ def disabled_ports(config: Any) -> set[str]:
     return out
 
 
+def bonds(config: Any) -> dict[str, list[str]]:
+    """Bonding interfaces (LAGs) and their member ports: netifd's `config
+    device` of type bonding (OpenWrt 24.10+, `list ports`), or proto-bonding's
+    `config interface` with `proto 'bonding'` (`list slaves`, device
+    bonding-<interface>)."""
+    out: dict[str, list[str]] = {}
+    for s in config_sections(config, "device"):
+        name = s.get("name")
+        if str(s.get("type") or "").lower() in ("bonding", "bond") and isinstance(name, str):
+            out[name] = vl.as_list(s.get("ports"))
+    for s in config_sections(config, "interface"):
+        if str(s.get("proto") or "").lower() == "bonding" and isinstance(s.get(".name"), str):
+            out[f"bonding-{s['.name']}"] = vl.as_list(s.get("slaves"))
+    return out
+
+
 def conduits(devices: dict[str, Any]) -> set[str]:
     """The CPU ports of DSA switches (eth0 on most routers): every LAN port's
     frames go through them, so they are not ports to turn off. netifd names
@@ -412,6 +433,8 @@ def build(raw: dict[str, Any], host: str | None) -> Device:
     # configuration, down and disabled.
     disabled = disabled_ports(raw.get("config"))
     cpu_ports = conduits(devices)
+    lags = bonds(raw.get("config"))
+    lag_of = {m: lag for lag, members in lags.items() for m in members}
     for name in disabled:
         devices.setdefault(name, {"present": False})
 
@@ -423,6 +446,8 @@ def build(raw: dict[str, Any], host: str | None) -> Device:
             continue
         seen.add(name)
         kind = "ethernet" if name in disabled else iface_type(name, st)
+        if name in lags:
+            kind = "lag"
         speed, duplex = parse_speed(st.get("speed"))
         up = st.get("carrier") if isinstance(st.get("carrier"), bool) else st.get("up")
         if name in disabled:
@@ -434,7 +459,7 @@ def build(raw: dict[str, Any], host: str | None) -> Device:
             enabled = name not in disabled
         stats = st.get("statistics") if isinstance(st.get("statistics"), dict) else {}
         parent, vid = vlan_of(name) if kind == "vlan" else (None, None)
-        members = st.get("bridge-members")
+        members = st.get("bridge-members") or lags.get(name)
         interfaces.append(
             Interface(
                 name=name,
@@ -455,6 +480,7 @@ def build(raw: dict[str, Any], host: str | None) -> Device:
                 tx_errors=counter(stats.get("tx_errors")),
                 vlan=vid,
                 vlans=port_vlans.get(name),
+                lag=lag_of.get(name),
             )
         )
     # Layer-3 devices netifd does not list (e.g. pppoe-wan).
@@ -512,6 +538,13 @@ def build(raw: dict[str, Any], host: str | None) -> Device:
         extra["wifi_networks"] = wlan.wifi_networks(raw["wireless"], raw.get("config")) or None
     if gateways and raw.get("config"):
         extra.update(router_networks(raw, wan_names(raw["interfaces"])))
+    if raw.get("dhcp"):
+        records = svc.dns_records(raw["dhcp"])
+        extra["dns_records"] = [DnsRecord(**r) for r in records] or None
+        extra["dns_domain"] = svc.dns_domain(raw["dhcp"])
+    if raw.get("firewall"):
+        found = svc.paused(raw["firewall"])
+        extra["paused"] = [PausedDevice(**p) for p in found] if found else None
 
     return Device(
         key=key,
@@ -732,6 +765,34 @@ def test(cfg: Config) -> str:
     return msg
 
 
+def backup(cfg: Config) -> list[ConfigBackup]:
+    """The router's uci configs (network, wireless, dhcp, firewall, system) as
+    `uci export` prints them, without secrets; configs the ACL does not let
+    Omini read are left out."""
+    client = client_from(cfg)
+    try:
+        raw, _ = read_all(client)
+        system = Reader(client).optional("uci", "get", {"config": "system"}, report=None)
+    finally:
+        client.close()
+    dev = build(raw, urlparse(client.base).hostname)
+    configs = {
+        "network": raw.get("config"),
+        "wireless": raw.get("wireless"),
+        "dhcp": raw.get("dhcp"),
+        "firewall": raw.get("firewall"),
+        "system": system,
+    }
+    content = bk.render(configs)
+    if not content:
+        raise PluginError(
+            f"the ACL of user {client.username!r} does not allow reading any uci config "
+            '(it needs "read": {"ubus": {"uci": ["get"]}, "uci": ["network", ...]}): '
+            "see the plugin's README"
+        )
+    return [ConfigBackup(device=dev.key, format="text", content=content)]
+
+
 # --- changes ---------------------------------------------------------------
 
 # How long rpcd waits for the confirmation before it restores the previous
@@ -808,6 +869,10 @@ def apply(cfg: Config, change: Change) -> list[Device]:
         return apply_vlans(cfg, change)
     if change.kind in ("network.set", "network.delete", "reservation.set", "reservation.delete"):
         return apply_networks(cfg, change)
+    if change.kind in ("dns.set", "dns.delete", "pause.set", "pause.delete"):
+        return apply_services(cfg, change)
+    if change.kind == "wol.send":
+        return apply_wol(cfg, change)
     if change.kind != "port.enabled" or not isinstance(change.value, bool):
         raise PluginError(f"this plugin cannot apply {change.kind} = {change.value!r}")
     port, value = change.port or "", change.value
@@ -1217,6 +1282,150 @@ def apply_networks(cfg: Config, change: Change) -> list[Device]:
 
         if ops:
             commit(c, names, ops, done, what)
+    finally:
+        c.close()
+    return collect(cfg)
+
+
+# --- DNS names, pause and Wake-on-LAN ------------------------------------------
+
+
+def own_ips(dump: Any) -> set[str]:
+    """The router's own IPv4 addresses (never paused)."""
+    logical = dump.get("interface") if isinstance(dump, dict) else None
+    out = set()
+    for li in logical or []:
+        for a in (li.get("ipv4-address") or []) if isinstance(li, dict) else []:
+            if isinstance(a, dict) and isinstance(a.get("address"), str):
+                out.add(a["address"])
+    return out
+
+
+def apply_services(cfg: Config, change: Change) -> list[Device]:
+    """dns.set / dns.delete (`config domain` in /etc/config/dhcp) and
+    pause.set / pause.delete (the `omini_paused` ipset and its "Omini pause"
+    rules in /etc/config/firewall). Staged in this session, applied with
+    rollback, read again, then confirmed."""
+    value = change.value if isinstance(change.value, dict) else {}
+    c = client_from(cfg)
+    try:
+        c.login()
+        if change.kind.startswith("dns."):
+            names = ["dhcp"]
+            dhcp = read_configs(c, names)["dhcp"]
+            name = svc.dns_name(value.get("name"))
+            if change.kind == "dns.set":
+                ops = svc.plan_dns_set(dhcp, value)
+                want = svc.ipv4(value.get("ip"))
+            else:
+                ops = svc.plan_dns_delete(dhcp, value)
+                want = None
+            what = f"the DNS name {name}"
+
+            def done() -> bool:
+                return svc.has_dns(read_configs(c, names)["dhcp"], name, want)
+
+        else:
+            names = ["firewall"]
+            firewall = read_configs(c, names)["firewall"]
+            dump = Reader(c).required("network.interface", "dump")
+            wans = wan_names(dump)
+            mac = nets.norm_mac(value.get("mac"))
+            if change.kind == "pause.set":
+                protected = own_ips(dump) | {urlparse(c.base).hostname or ""}
+                ops = svc.plan_pause_set(firewall, value, wans, protected)
+                ips: list[str] | None = [
+                    ip for ip in (svc.ipv4(x) for x in value.get("ips") or []) if ip
+                ]
+                what = f"the pause of {mac}"
+            else:
+                ops = svc.plan_pause_delete(firewall, value, wans)
+                ips = None
+                what = f"the resume of {mac}"
+
+            def done() -> bool:
+                got = read_configs(c, names)["firewall"]
+                return svc.pause_matches(got, mac, ips, wans)
+
+        if ops:
+            commit(c, names, ops, done, what)
+    finally:
+        c.close()
+    return collect(cfg)
+
+
+ETHERWAKE = "/usr/bin/etherwake"
+WOL_ACL = (
+    '"ubus": {"file": ["stat", "exec"]} and "file": {"/usr/bin/etherwake": ["list", "exec"]} '
+    "in its ACL file (see the plugin's README)"
+)
+
+
+def wol_device(dump: Any, ip: str | None) -> str:
+    """The device (br-lan, br-lan.30...) of the LAN-side interface whose
+    network holds ip; without ip, the `lan` interface's."""
+    wans = wan_names(dump)
+    logical = dump.get("interface") if isinstance(dump, dict) else None
+    for li in logical or []:
+        if not isinstance(li, dict):
+            continue
+        name = str(li.get("interface") or "")
+        dev = li.get("l3_device") or li.get("device")
+        if not isinstance(dev, str) or name in wans or dev in wans or name == "loopback":
+            continue
+        if ip is None:
+            if name == "lan":
+                return dev
+            continue
+        for a in li.get("ipv4-address") or []:
+            try:
+                net = ipaddress.ip_interface(f"{a.get('address')}/{a.get('mask')}").network
+            except (ValueError, AttributeError):
+                continue
+            if ipaddress.ip_address(ip) in net:
+                return dev
+    if ip is None:
+        raise PluginError("the router has no lan interface to send the Wake-on-LAN packet on")
+    raise PluginError(f"none of the router's local networks holds {ip}")
+
+
+def apply_wol(cfg: Config, change: Change) -> list[Device]:
+    """wol.send: etherwake (`file exec` of /usr/bin/etherwake only, as the ACL
+    allows) sends the magic packet, broadcast, on the interface of the
+    network that holds the device's address. Nothing to verify."""
+    value = change.value if isinstance(change.value, dict) else {}
+    mac = norm_mac(value.get("mac"))
+    if not mac:
+        raise PluginError("Wake-on-LAN needs the device's MAC address")
+    ip = svc.ipv4(value.get("ip")) if value.get("ip") else None
+    if value.get("ip") and ip is None:
+        raise PluginError(f"{value.get('ip')!r} is not an IPv4 address")
+    c = client_from(cfg)
+    try:
+        c.login()
+        dev = wol_device(Reader(c).required("network.interface", "dump"), ip)
+        try:
+            c.call("file", "stat", {"path": ETHERWAKE})
+        except AccessDenied:
+            pass  # the ACL may grant exec only: the exec below says what is missing
+        except Unavailable as e:
+            raise PluginError(
+                "etherwake is not installed on the router: install it (opkg install etherwake, "
+                "or apk add etherwake) to wake devices from it"
+            ) from e
+        try:
+            res = c.call("file", "exec", {"command": ETHERWAKE, "params": ["-b", "-i", dev, mac]})
+        except AccessDenied as e:
+            raise PluginError(
+                f"the ACL of user {c.username!r} does not allow running etherwake: it needs "
+                + WOL_ACL
+            ) from e
+        except Unavailable as e:
+            raise PluginError(f"etherwake did not run on the router: {e}") from e
+        code = res.get("code") if isinstance(res, dict) else None
+        if code not in (0, None):
+            err = str(res.get("stderr") or "").strip() if isinstance(res, dict) else ""
+            raise PluginError(f"etherwake failed (exit {code}){': ' + err if err else ''}")
     finally:
         c.close()
     return collect(cfg)
