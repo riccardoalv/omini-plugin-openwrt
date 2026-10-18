@@ -11,7 +11,7 @@
 | Hostname, model, OpenWrt version | `system board` (**required**) | The device on the map |
 | Uptime, memory, swap, load, overlay (`/`) and `/tmp` usage | `system info` | Device health |
 | Ports: status (carrier), **link speed / duplex** (`1000F`), MAC, traffic and error counters, bridge members, bridge VLANs (DSA) | `network.device status` | Ports on the map, link speed, traffic, VLANs |
-| Logical interfaces (lan, wan...): IPs, default route → **WAN** with its gateway; PPPoE links on their port | `network.interface dump` | WAN nodes, IPs of the ports, router or AP |
+| Logical interfaces (lan, wan...): IPs, default route (off the LAN side, below) → **WAN** with its gateway; PPPoE links on their port | `network.interface dump` | WAN nodes, IPs of the ports, router or AP |
 | Host names (from ARP, DHCP, `/etc/ethers`) | `luci-rpc getHostHints` | Names of the devices behind the router |
 | DHCP leases | `luci-rpc getDHCPLeases` | Names and addresses of clients |
 | Wi-Fi networks (SSID, band) and **clients** with signal and link rates | `iwinfo devices`, `iwinfo info`, `iwinfo assoclist` | Wi-Fi clients on the map |
@@ -25,7 +25,7 @@
 | ARP table | `file read` of `/proc/net/arp` | Which IP and MAC are on which interface |
 | Temperatures (kernel thermal zones) | `file list` / `file read` under `/sys/class/thermal` | Device health (optional) |
 
-The device is a **router** when one of its interfaces has a default route (or is a `wan*` interface that is down), else an **access point**.
+The device is a **router** when one of its interfaces has a default route (or is a `wan*` interface that is down), else an **access point**. A default route on the LAN side is not a WAN: a dumb access point whose `lan` has a static gateway stays an access point. The LAN side is an interface whose firewall zone neither masquerades nor is the destination of a forwarding (`lan` in a default configuration), or, in no zone or without the `firewall` config, the interface named `lan`.
 
 Every method but `system board` is optional: when the ACL refuses it, or the device does not have it (no Wi-Fi, no LuCI), that data is skipped and the rest is still collected. **Test connection** lists the methods the ACL refused.
 
@@ -201,7 +201,7 @@ rpcd logins are not system users: each is an entry in `/etc/config/rpcd` that ma
 - `session login` (with the username and password) returns a session id (`ubus_rpc_session`); every `call` carries it. The session is kept in the plugin's state folder and reused while it is valid — rpcd sessions expire after 5 minutes without use, and each use renews them. When ubus refuses a reused session (`Access denied`, -32002), the plugin logs in again once.
 - Methods ([ubus reference](https://openwrt.org/docs/techref/ubus), [rpcd](https://openwrt.org/docs/techref/rpcd)):
   - `system board`, `system info` (procd): `load` values are scaled by 65536; `root` and `tmp` sizes are in KiB.
-  - `network.device status`, `network.interface dump` (netifd): `speed` such as `1000F` (Mbps + duplex); `bridge-vlans` ports read `lan1` (untagged), `lan1:t` (tagged), `lan1:*` (PVID); a WAN is a logical interface with a `0.0.0.0/0` or `::/0` route, its `nexthop` is the gateway, and a PPPoE `l3_device` (`pppoe-wan`) runs on its `device`.
+  - `network.device status`, `network.interface dump` (netifd): `speed` such as `1000F` (Mbps + duplex); `bridge-vlans` ports read `lan1` (untagged), `lan1:t` (tagged), `lan1:*` (PVID); a WAN is a logical interface off the LAN side with a `0.0.0.0/0` or `::/0` route, its `nexthop` is the gateway, and a PPPoE `l3_device` (`pppoe-wan`) runs on its `device`.
   - `iwinfo devices` / `info` / `assoclist` (rpcd-mod-iwinfo): band from the channel frequency (else the radio's modes), rates in kbit/s → Mbps. Only interfaces in AP mode (`Master`) list clients — a client-mode interface's upstream AP is not a client.
   - `luci-rpc getHostHints` / `getDHCPLeases` (LuCI's rpcd plugin).
   - `file read` / `file list` (rpcd's file plugin), restricted to the paths in the ACL.

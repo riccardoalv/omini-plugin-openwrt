@@ -158,6 +158,26 @@ def is_default_route(route: dict[str, Any]) -> bool:
     return route.get("target") in ("0.0.0.0", "::") and as_int(route.get("mask")) == 0
 
 
+def lan_side(firewall: Any, name: str) -> bool:
+    """Whether a logical interface is on the LAN side, where a default route
+    (a dumb access point's gateway on its lan) is no WAN: its firewall zone
+    neither masquerades nor is a forwarding's destination; in no zone (or
+    without the firewall config), OpenWrt's name for it, "lan"."""
+    zone = nets.zone_of(firewall, name)
+    if zone is None:
+        return name == "lan"
+    if str(zone.get("masq", "0")).strip().lower() in nets.ON:
+        return False
+    return all(f.get("dest") != zone.get("name") for f in wlan.sections(firewall, "forwarding"))
+
+
+def default_routes(li: dict[str, Any], firewall: Any) -> list[dict[str, Any]]:
+    """The default routes that make a logical interface a WAN."""
+    if lan_side(firewall, str(li.get("interface") or "")):
+        return []
+    return [r for r in li.get("route") or [] if isinstance(r, dict) and is_default_route(r)]
+
+
 def addresses(iface: dict[str, Any]) -> list[str]:
     out = []
     for key in ("ipv4-address", "ipv6-address"):
@@ -412,7 +432,7 @@ def build(raw: dict[str, Any], host: str | None) -> Device:
         dev = li.get("device")
         if isinstance(dev, str) and dev != l3:
             parent_of[l3] = dev  # pppoe-wan runs on eth1 (or a VLAN of it)
-        routes = [r for r in li.get("route") or [] if isinstance(r, dict) and is_default_route(r)]
+        routes = default_routes(li, raw.get("firewall"))
         up = li.get("up") is True
         down_uplink = not up and name.startswith("wan") and str(li.get("proto")) in UPLINK_PROTOS
         if not routes and not down_uplink:
@@ -542,7 +562,7 @@ def build(raw: dict[str, Any], host: str | None) -> Device:
     if "wifi_networks" in Device.model_fields and raw.get("wireless"):
         extra["wifi_networks"] = wlan.wifi_networks(raw["wireless"], raw.get("config")) or None
     if gateways and raw.get("config"):
-        extra.update(router_networks(raw, wan_names(raw["interfaces"])))
+        extra.update(router_networks(raw, wan_names(raw["interfaces"], raw.get("firewall"))))
     if raw.get("dhcp"):
         records = svc.dns_records(raw["dhcp"])
         extra["dns_records"] = [DnsRecord(**r) for r in records] or None
@@ -577,16 +597,16 @@ def build(raw: dict[str, Any], host: str | None) -> Device:
     )
 
 
-def wan_names(dump: Any) -> set[str]:
-    """The WANs' logical interfaces and their devices: a default route, or a
-    wan* uplink that is down."""
+def wan_names(dump: Any, firewall: Any = None) -> set[str]:
+    """The WANs' logical interfaces and their devices: a default route off the
+    LAN side (see lan_side), or a wan* uplink that is down."""
     logical = dump.get("interface") if isinstance(dump, dict) else None
     out: set[str] = set()
     for li in logical or []:
         if not isinstance(li, dict):
             continue
         name = str(li.get("interface") or "")
-        routes = [r for r in li.get("route") or [] if isinstance(r, dict) and is_default_route(r)]
+        routes = default_routes(li, firewall)
         down = (
             li.get("up") is not True
             and name.startswith("wan")
@@ -1271,7 +1291,7 @@ def apply_networks(cfg: Config, change: Change) -> list[Device]:
 
             what = f"the reservation of {mac}"
         else:
-            wans = wan_names(Reader(c).required("network.interface", "dump"))
+            wans = wan_names(Reader(c).required("network.interface", "dump"), configs["firewall"])
             vid = int(value.get("vlan") or 0)
             what = f"the network of VLAN {vid}"
             if change.kind == "network.set":
@@ -1337,7 +1357,7 @@ def apply_services(cfg: Config, change: Change) -> list[Device]:
             names = ["firewall"]
             firewall = read_configs(c, names)["firewall"]
             dump = Reader(c).required("network.interface", "dump")
-            wans = wan_names(dump)
+            wans = wan_names(dump, firewall)
             mac = nets.norm_mac(value.get("mac"))
             if change.kind == "pause.set":
                 protected = own_ips(dump) | {urlparse(c.base).hostname or ""}

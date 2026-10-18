@@ -281,3 +281,29 @@ def test_the_key_without_macs_or_address():
     assert build(bare({"hostname": "ap-hall"}), "192.168.1.2").key == "192.168.1.2"
     with pytest.raises(PluginError, match="nothing to tell this device apart"):
         build(bare({}), None)  # never the literal "None"
+
+
+@pytest.mark.parametrize("firewall", [True, False])
+def test_a_dumb_ap_with_a_gateway_on_its_lan_is_no_router(openwrt, cfg, firewall):
+    dump = openwrt.routes[("network.interface", "dump")]["interface"]
+    dump[:] = [i for i in dump if not i["interface"].startswith("wan")]
+    lan = next(i for i in dump if i["interface"] == "lan")
+    lan["route"] = [{"target": "0.0.0.0", "mask": 0, "nexthop": "192.168.1.254"}]
+    if not firewall:
+        openwrt.denied.add("uci get")  # without the zones: OpenWrt's "lan" name
+    [dev] = collect(cfg)
+    assert dev.role == "ap" and dev.gateways is None
+    assert not any(i.wan for i in dev.interfaces)
+
+
+def test_a_default_route_in_the_wan_zone_is_a_wan(openwrt, cfg):
+    # The uplink is named "lan" but sits in the masquerading zone: a router.
+    dump = openwrt.routes[("network.interface", "dump")]["interface"]
+    dump[:] = [i for i in dump if not i["interface"].startswith("wan")]
+    lan = next(i for i in dump if i["interface"] == "lan")
+    lan["route"] = [{"target": "0.0.0.0", "mask": 0, "nexthop": "192.168.1.254"}]
+    zones = openwrt.other["firewall"]["values"]
+    zones["cfg02dc81"]["network"] = []
+    zones["cfg03dc81"]["network"] = ["lan"]
+    [dev] = collect(cfg)
+    assert dev.role == "router" and [g.name for g in dev.gateways] == ["lan"]
