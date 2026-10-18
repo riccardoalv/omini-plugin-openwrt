@@ -520,7 +520,12 @@ def build(raw: dict[str, Any], host: str | None) -> Device:
             macs.append(i.mac)
     lan_dev = next((d for d, ns in names_on.items() if "lan" in ns), None)
     lan_mac = next((i.mac for i in interfaces if i.name == lan_dev and i.mac), None)
-    key = lan_mac or (macs[0] if macs else None) or host or str(board.get("hostname"))
+    hostname = board.get("hostname") if isinstance(board.get("hostname"), str) else None
+    key = lan_mac or (macs[0] if macs else None) or host or hostname
+    if not key:
+        raise PluginError(
+            "OpenWrt reported no MAC address or host name: nothing to tell this device apart"
+        )
 
     release = board.get("release") if isinstance(board.get("release"), dict) else {}
     os_version = " ".join(

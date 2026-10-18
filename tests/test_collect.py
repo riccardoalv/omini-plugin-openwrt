@@ -4,7 +4,7 @@ import httpx
 import pytest
 from omini_sdk import Config, PluginError
 
-from omini_openwrt.collect import band_of, collect, norm_mac, parse_speed
+from omini_openwrt.collect import band_of, build, collect, norm_mac, parse_speed
 from omini_openwrt.collect import test as connection_test
 
 
@@ -268,3 +268,16 @@ def test_speed(raw, want):
 )
 def test_band(info, want):
     assert band_of(info) == want
+
+
+def bare(board):
+    """A device that answered system board only."""
+    raw = dict.fromkeys(("info", "devices", "interfaces", "hints", "leases", "arp", "config"))
+    return {**raw, "board": board, "wifi": [], "temps": []}
+
+
+def test_the_key_without_macs_or_address():
+    assert build(bare({"hostname": "ap-hall"}), None).key == "ap-hall"
+    assert build(bare({"hostname": "ap-hall"}), "192.168.1.2").key == "192.168.1.2"
+    with pytest.raises(PluginError, match="nothing to tell this device apart"):
+        build(bare({}), None)  # never the literal "None"
