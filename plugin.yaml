@@ -9,7 +9,8 @@ description: >-
   ports with link speed, traffic and bridge VLANs, WANs, Wi-Fi networks and
   clients with signal and rates, ARP, DHCP leases, host names, memory, load,
   disks, temperatures and uptime, and each VLAN's network (interface, DHCP
-  range, firewall access, fixed addresses). It enables or disables ports,
+  range, firewall access, fixed addresses) and the port forwards (firewall
+  redirects and UPnP mappings). It enables or disables ports,
   changes the ports' VLANs (bridge VLAN filtering), creates and deletes VLANs
   and their networks, sets fixed addresses and manages the Wi-Fi networks of
   each VLAN, local DNS names (dnsmasq) and paused devices (fw4 rules by

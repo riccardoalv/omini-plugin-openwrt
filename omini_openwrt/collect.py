@@ -29,8 +29,10 @@ from omini_sdk import (
     WirelessClient,
     log,
 )
+from omini_sdk.models import PortForward
 
 from omini_openwrt import backup as bk
+from omini_openwrt import forwards as fwd
 from omini_openwrt import networks as nets
 from omini_openwrt import services as svc
 from omini_openwrt import vlans as vl
@@ -274,6 +276,11 @@ def read_all(client: Client) -> tuple[dict[str, Any], list[str]]:
     # A router's networks: their DHCP ranges and fixed addresses, and their access.
     raw["dhcp"] = r.optional("uci", "get", {"config": "dhcp"}, report="uci get dhcp")
     raw["firewall"] = r.optional("uci", "get", {"config": "firewall"}, report="uci get firewall")
+    # Ports devices opened through UPnP or NAT-PMP (miniupnpd), when installed.
+    raw["upnp"] = r.optional("luci.upnp", "get_status", report=None)
+    raw["upnp_leases"] = (
+        r.file_read(fwd.LEASE_FILE, report=False) if not isinstance(raw["upnp"], dict) else None
+    )
     raw["arp"] = r.file_read("/proc/net/arp")
     raw["temps"] = read_temperatures(r)
     return raw, r.denied
@@ -577,6 +584,9 @@ def build(raw: dict[str, Any], host: str | None) -> Device:
     if raw.get("firewall"):
         found = svc.paused(raw["firewall"])
         extra["paused"] = [PausedDevice(**p) for p in found] if found else None
+    forwards = port_forwards(raw)
+    if forwards is not None:
+        extra["port_forwards"] = forwards or None
 
     return Device(
         key=key,
@@ -605,6 +615,20 @@ def build(raw: dict[str, Any], host: str | None) -> Device:
         vlans=vlans or None,
         **extra,
     )
+
+
+def port_forwards(raw: dict[str, Any]) -> list[PortForward] | None:
+    """The firewall's DNAT redirects and the UPnP mappings; None when neither
+    could be read."""
+    found = None
+    if raw.get("firewall"):
+        found = fwd.redirects(raw["firewall"])
+    upnp = fwd.upnp_status(raw.get("upnp"))
+    if upnp is None and isinstance(raw.get("upnp_leases"), str):
+        upnp = fwd.upnp_leases(raw["upnp_leases"])
+    if upnp is not None:
+        found = (found or []) + upnp
+    return [PortForward(**f) for f in found] if found is not None else None
 
 
 def wan_names(dump: Any, firewall: Any = None) -> set[str]:

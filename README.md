@@ -20,6 +20,8 @@
 | Each network's access (its firewall zone, rules and forwardings) | `uci get` of the `firewall` config | Networks (routers) |
 | Local DNS names (`config domain`) and the local domain (dnsmasq's `domain`) | `uci get` of the `dhcp` config | DNS names |
 | Paused devices (the "Omini pause" rules) | `uci get` of the `firewall` config | Paused devices (routers) |
+| Port forwards (`config redirect` with target DNAT: `src_dport`, `dest_ip`, `dest_port`, `proto`, `src_ip`, `name`, `enabled`) | `uci get` of the `firewall` config | Exposed to the internet (routers) |
+| Ports devices opened through UPnP IGD or NAT-PMP (miniupnpd) | `luci.upnp get_status` (luci-app-upnp), else `file read` of `/var/run/miniupnpd.leases` | Exposed to the internet (optional, silent when missing) |
 | Bonding interfaces (`config device` type `bonding`, `proto 'bonding'`) | `uci get` of the `network` config | LAGs |
 | Host name, time zone, NTP | `uci get` of the `system` config | Backups only |
 | ARP table | `file read` of `/proc/net/arp` | Which IP and MAC are on which interface |
@@ -103,6 +105,10 @@ Version 0.3.0 paused by IPv4 address only (an ipset `omini_paused` and rules mat
 
 `backup` returns the `network`, `wireless`, `dhcp`, `firewall` and `system` configs (those the ACL lets Omini read) as one text, as `uci export` prints them, sections in the file's order (rpcd's `.index`). Options holding secrets are left out: Wi-Fi keys (`key`, `key1`-`key4`, `sae_password`), RADIUS secrets, `password` (PPPoE...), WireGuard `private_key` / `preshared_key`. There is no status, lease or counter in it, so two backups differ only when the configuration changed.
 
+### Port forwards (read only)
+
+Collect reports `port_forwards`: each `config redirect` of `/etc/config/firewall` with target DNAT (fw4's default for a redirect) and an external port (`src_dport`, a port or a range `8000-8010`), with its protocol (`tcp`, `udp`, or both when `proto` is missing or `tcp udp`; ICMP and other protocols are left out), internal address (`dest_ip`, IPv4 or IPv6) and port (`dest_port`, else the external one), source (`src_ip`), name and whether it is enabled; and, with miniupnpd installed, the mappings devices opened by themselves (`upnp: true`), from luci-app-upnp's `luci.upnp get_status` or else miniupnpd's lease file. Omini never changes them. Leave `luci.upnp` and the lease file out of the ACL if you do not want them read.
+
 ### LAGs and STP (read only)
 
 Bonding interfaces are reported as LAGs: a `config device` of type `bonding` (OpenWrt 24.10's netifd, `list ports`) or a proto-bonding interface (`proto 'bonding'`, `list slaves`, device `bonding-<interface>`); the bond is `type: lag` and each member port reports `lag: <bond>`. **STP** is not reported: netifd's `network.device status` shows a bridge's `stp` setting but no per-port state or role (those are only in sysfs, `/sys/class/net/<bridge>/brif/<port>/state`).
@@ -132,11 +138,13 @@ rpcd logins are not system users: each is an entry in `/etc/config/rpcd` that ma
            "luci-rpc": ["getHostHints", "getDHCPLeases"],
            "iwinfo": ["devices", "info", "assoclist"],
            "file": ["read", "list"],
+           "luci.upnp": ["get_status"],
            "uci": ["get"]
          },
          "uci": ["network", "wireless", "dhcp", "firewall", "system"],
          "file": {
            "/proc/net/arp": ["read"],
+           "/var/run/miniupnpd.leases": ["read"],
            "/sys/class/thermal": ["list"],
            "/sys/class/thermal/thermal_zone*/type": ["read"],
            "/sys/class/thermal/thermal_zone*/temp": ["read"]
@@ -221,6 +229,7 @@ Built from documentation without hardware, so:
 - **VLANs and networks** were built from netifd's, rpcd's and fw4's documentation and source, not tested on hardware: the bridge-vlan port syntax (`lan1:u*`, `lan1:t`), `config dhcp` start/limit and fw4 rules with `dest '*'` and `dest_ip` lists are as documented. A network's name is its interface's name (OpenWrt interfaces have no description). Wi-Fi networks on a deleted network's interface are left as they are.
 - **Wi-Fi traffic** per client: iwinfo gives byte counters, not current rates, so clients carry link rates and signal but no ↓/↑ traffic.
 - A WAN that is **down** is recognized only by OpenWrt's naming convention (`wan`, `wan6`, `wanb`...) with an uplink protocol (DHCP, PPPoE, static...).
+- **Not verified on hardware** (port forwards): `luci.upnp get_status` answering `{rules: [{proto, extport, intaddr, intport, description}]}` (luci-app-upnp's rpcd plugin); the lease file at `/var/run/miniupnpd.leases` (miniupnpd's `upnp_lease_file` default on OpenWrt) with lines `PROTO:EXT_PORT:INT_IP:INT_PORT[:TIMESTAMP]:DESCRIPTION`; IPv6 pinholes are not read. The WAN interface of a forward is left empty (a redirect names a zone, not an interface).
 - **Not verified on hardware** (DNS, pause, Wake-on-LAN, backups, LAGs): `rpcd`'s `file stat` needing the path's `list` permission (if your rpcd checks another one, the plugin goes on to `file exec` without the check); `file exec` answering `{code, stdout, stderr}` and status 4 for a missing program; fw4 accepting the `omini` list on a rule (fw4 ignores options it does not know) and `list src_mac` with `family any` matching routed IPv4 and IPv6 traffic in the forward chain; `config device` type `bonding` with `ports` and proto-bonding's `slaves` / `bonding-<interface>` device name; rpcd's `.index` on sections.
 - **Pausing** blocks new connections only: fw4 accepts established connections before the zone rules, and cutting them (conntrack) needs a program the ACL does not run, so a download already running goes on until it ends. A rule placed before Omini's in the file that accepts that traffic (e.g. a custom LAN-to-WAN accept) wins; the plugin cannot reorder rules.
 - The exact shape of answers may vary between OpenWrt releases; unknown or missing fields are left empty, never guessed.
