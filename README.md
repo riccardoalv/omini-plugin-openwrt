@@ -41,7 +41,7 @@ Every method but `system board` is optional: when the ACL refuses it, or the dev
 
 A disabled port is down for netifd (it leaves it out of the bridge), stays down after a reboot, and appears as **Disabled** on the map. The plugin refuses the switch's CPU port (`eth0` on most routers, which carries every LAN port), bridges, VLANs and Wi-Fi interfaces, and routers whose switch uses **swconfig** (older devices with `config switch` sections), where ports are not separate devices.
 
-**Wi-Fi per VLAN** (`wifi.set`, `wifi.delete`) works the same way on `/etc/config/wireless`: the access point of each radio is added, changed (name, network, password, on or off) or deleted, applied with rollback, read again and confirmed. A VLAN with no interface on the router gets one (a `bridge-vlan` tagged on the ports VLAN 1 has, and an unmanaged interface on it) only when the bridge already filters VLANs; otherwise the plugin asks to turn bridge VLAN filtering on in LuCI first. The password is written to the router only.
+**Wi-Fi per VLAN** (`wifi.set`, `wifi.delete`) works the same way on `/etc/config/wireless`: the access point of each radio is added, changed (name, network, password, on or off) or deleted, applied with rollback, read again (the name, the VLAN and on or off as asked) and confirmed, else rolled back. A VLAN with no interface on the router gets one (a `bridge-vlan` tagged on the ports VLAN 1 has, and an unmanaged interface on it) only when the bridge already filters VLANs; otherwise the plugin asks to turn bridge VLAN filtering on in LuCI first. The password is written to the router only.
 
 ### VLANs of the ports (`port.vlans`, `vlan.set`, `vlan.delete`)
 

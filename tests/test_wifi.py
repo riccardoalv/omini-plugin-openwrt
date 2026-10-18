@@ -162,3 +162,34 @@ def test_a_new_network_uses_wpa3_on_6_ghz_radios(router, cfg):
 def test_no_vlan_moves_the_network_back_to_the_lan(router, cfg):
     apply(cfg, wifi_change(ssid="Things", vlan=None))  # it was on iot (VLAN 30)
     assert aps(router)["c"]["network"] == "lan"
+
+
+def test_a_change_is_confirmed_once_read_back(router, cfg):
+    apply(cfg, wifi_change(ssid="House", previous="Home", enabled=False))
+    got = {w["ssid"]: w for w in wifi.wifi_networks(router.other["wireless"], router.network)}
+    assert "Home" not in got and got["House"]["enabled"] is False
+    apply(cfg, wifi_change("wifi.delete", ssid="Things"))
+    assert all(s.get("ssid") != "Things" for s in aps(router).values())
+    assert router.confirmed == 2 and router.pending is None
+
+
+def read_back_as(monkeypatch, **wrong):
+    """The router reads back the Wi-Fi networks with these fields changed."""
+    real = wifi.wifi_networks
+
+    def networks(wireless, network):
+        return [{**w, **wrong} for w in real(wireless, network)]
+
+    monkeypatch.setattr(collect_module.wlan, "wifi_networks", networks)
+
+
+@pytest.mark.parametrize("wrong", [{"vlan": 30}, {"enabled": True}])
+def test_rolled_back_and_reverted_unless_read_back_as_asked(router, cfg, monkeypatch, wrong):
+    before = copy.deepcopy(router.other["wireless"])
+    read_back_as(monkeypatch, **wrong)
+    with pytest.raises(PluginError, match=r"rolled back, not saved"):
+        apply(cfg, wifi_change(ssid="Home", enabled=False))
+    assert router.other["wireless"] == before and router.confirmed == 0
+    # After the rollback, this session's staged changes are dropped too.
+    uci = [m for o, m in router.calls if o == "uci"]
+    assert uci[uci.index("rollback") + 1 :][:2] == ["revert", "revert"]

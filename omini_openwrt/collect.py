@@ -970,69 +970,57 @@ def apply(cfg: Config, change: Change) -> list[Device]:
 def apply_wifi(cfg: Config, change: Change) -> list[Device]:
     """wifi.set: a Wi-Fi network on every radio of the router (its name, the
     VLAN's interface, the password, on or off); wifi.delete removes it. Staged
-    in this session, applied with rollback, read again, then confirmed — as
-    LuCI saves a change."""
+    in this session, applied with rollback, read again (name, VLAN, on or
+    off), then confirmed — as LuCI saves a change."""
     value = change.value if isinstance(change.value, dict) else {}
     ssid = str(value.get("ssid") or "")
+    previous = value.get("previous")
+    names = ["wireless", "network"]
     c = client_from(cfg)
     try:
         c.login()
-        try:
-            wireless = c.call("uci", "get", {"config": "wireless"})
-            network = c.call("uci", "get", {"config": "network"})
-        except AccessDenied as e:
-            raise PluginError(
-                f"the ACL of user {c.username!r} does not allow reading the wireless config: "
-                + WRITE_ACL
-            ) from e
-        for config in ("wireless", "network"):
-            _write(c, "revert", {"config": config})
+        configs = read_configs(c, names)
+        wireless, network = configs["wireless"], configs["network"]
         aps = [
             s
             for s in wlan.sections(wireless, "wifi-iface")
-            if s.get("mode", "ap") == "ap" and s.get("ssid") in (ssid, value.get("previous"))
+            if s.get("mode", "ap") == "ap" and s.get("ssid") in (ssid, previous)
         ]
         if change.kind == "wifi.delete":
             if not aps:
                 raise PluginError(f'the router has no Wi-Fi network "{ssid}"')
-            for s in aps:
-                _write(c, "delete", {"config": "wireless", "section": s[".name"]})
+            ops: list[tuple[str, dict[str, Any]]] = [
+                ("delete", {"config": "wireless", "section": s[".name"]}) for s in aps
+            ]
         else:
-            stage_wifi(c, wireless, network, value, aps)
-        try:
-            c.call("uci", "apply", {"rollback": True, "timeout": ROLLBACK_S})
-        except (AccessDenied, UbusError) as e:
-            for config in ("wireless", "network"):
-                _quietly(c, "revert", {"config": config})
-            raise PluginError(
-                f"OpenWrt did not apply the Wi-Fi change: {e} (nothing was changed)"
-            ) from e
-        after = wlan.wifi_networks(
-            c.call("uci", "get", {"config": "wireless"}),
-            c.call("uci", "get", {"config": "network"}),
-        )
-        got = next((w for w in after if w["ssid"] == ssid), None)
-        ok = got is None if change.kind == "wifi.delete" else got is not None
-        if not ok:
-            _quietly(c, "rollback", {})
-            raise PluginError("OpenWrt did not apply the Wi-Fi change (rolled back, not saved)")
-        try:
-            c.call("uci", "confirm", {})
-        except UbusError as e:
-            raise PluginError(
-                f"could not confirm the Wi-Fi change: OpenWrt restores the previous "
-                f"configuration in {ROLLBACK_S} s"
-            ) from e
+            ops = stage_wifi(wireless, network, value, aps)
+        vid = int(value.get("vlan") or 1)
+        enabled = value.get("enabled")
+
+        def done() -> bool:
+            got = read_configs(c, names)
+            by = {w["ssid"]: w for w in wlan.wifi_networks(got["wireless"], got["network"])}
+            if change.kind == "wifi.delete":
+                return ssid not in by
+            w = by.get(ssid)
+            if w is None or (previous and previous != ssid and previous in by):
+                return False
+            if w["vlan"] != (vid if vid != 1 else None):
+                return False
+            return enabled is None or w["enabled"] == bool(enabled)
+
+        commit(c, names, ops, done, f'the Wi-Fi network "{ssid}"')
     finally:
         c.close()
     return collect(cfg)
 
 
 def stage_wifi(
-    c: Client, wireless: Any, network: Any, value: dict[str, Any], aps: list[dict[str, Any]]
-) -> None:
+    wireless: Any, network: Any, value: dict[str, Any], aps: list[dict[str, Any]]
+) -> list[tuple[str, dict[str, Any]]]:
     """The uci writes of a wifi.set: the VLAN's interface when missing, then
     each radio's access point."""
+    ops: list[tuple[str, dict[str, Any]]] = []
     # No VLAN is the untagged LAN (VLAN 1): an existing network moves back to it.
     iface, writes = wlan.plan_interface(network, int(value.get("vlan") or 1))
     for kind, values in writes:
@@ -1040,7 +1028,7 @@ def stage_wifi(
         args: dict[str, Any] = {"config": "network", "type": kind, "values": values}
         if name:
             args["name"] = name
-        _write(c, "add", args)
+        ops.append(("add", args))
     options: dict[str, Any] = {"ssid": str(value["ssid"]), "network": iface}
     if value.get("password"):
         options["key"] = str(value["password"])
@@ -1055,27 +1043,29 @@ def stage_wifi(
             if value.get("password") and str(s.get("encryption") or "none") in ("none", "owe"):
                 radio = next((r for r in radios if r.get(".name") == s.get("device")), None)
                 mine["encryption"] = wlan.encryption_for(radio)
-            _write(c, "set", {"config": "wireless", "section": s[".name"], "values": mine})
-        return
+            ops.append(("set", {"config": "wireless", "section": s[".name"], "values": mine}))
+        return ops
     if not value.get("password"):
         raise PluginError("a new Wi-Fi network needs a password")
     if not radios:
         raise PluginError("the router has no Wi-Fi radio")
     for r in radios:
-        _write(
-            c,
-            "add",
-            {
-                "config": "wireless",
-                "type": "wifi-iface",
-                "values": {
-                    "device": r[".name"],
-                    "mode": "ap",
-                    "encryption": wlan.encryption_for(r),
-                    **options,
+        ops.append(
+            (
+                "add",
+                {
+                    "config": "wireless",
+                    "type": "wifi-iface",
+                    "values": {
+                        "device": r[".name"],
+                        "mode": "ap",
+                        "encryption": wlan.encryption_for(r),
+                        **options,
+                    },
                 },
-            },
+            )
         )
+    return ops
 
 
 def wait_for(c: Client, port: str, enabled: bool) -> bool:
