@@ -1049,18 +1049,19 @@ def stage_wifi(
         options["key"] = str(value["password"])
     if value.get("enabled") is not None:
         options["disabled"] = "0" if value["enabled"] else "1"
+    radios = wlan.sections(wireless, "wifi-device")
     if aps:
         for s in aps:
             # Each access point keeps its own encryption; only an open one
             # gets one with the password.
             mine = dict(options)
             if value.get("password") and str(s.get("encryption") or "none") in ("none", "owe"):
-                mine["encryption"] = "psk2"
+                radio = next((r for r in radios if r.get(".name") == s.get("device")), None)
+                mine["encryption"] = wlan.encryption_for(radio)
             _write(c, "set", {"config": "wireless", "section": s[".name"], "values": mine})
         return
     if not value.get("password"):
         raise PluginError("a new Wi-Fi network needs a password")
-    radios = wlan.sections(wireless, "wifi-device")
     if not radios:
         raise PluginError("the router has no Wi-Fi radio")
     for r in radios:
@@ -1070,7 +1071,12 @@ def stage_wifi(
             {
                 "config": "wireless",
                 "type": "wifi-iface",
-                "values": {"device": r[".name"], "mode": "ap", "encryption": "psk2", **options},
+                "values": {
+                    "device": r[".name"],
+                    "mode": "ap",
+                    "encryption": wlan.encryption_for(r),
+                    **options,
+                },
             },
         )
 

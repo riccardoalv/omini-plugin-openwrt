@@ -134,3 +134,26 @@ def test_a_password_secures_only_the_open_access_points(router, cfg):
     assert got["a"]["encryption"] == "psk2"
     assert got["b"]["encryption"] == "sae"  # not downgraded by the open one before it
     assert got["a"]["key"] == got["b"]["key"] == "a-long-password"
+
+
+def test_security_is_named_only_when_the_model_has_it():
+    assert wifi.security_of("psk2+ccmp") == "wpa2"
+    assert wifi.security_of("wpa2") == "wpa2"  # WPA2-Enterprise
+    assert wifi.security_of("sae") == wifi.security_of("wpa3") == "wpa3"
+    assert wifi.security_of("sae-mixed") == wifi.security_of("wpa3-mixed") == "wpa2wpa3"
+    assert wifi.security_of(None) == wifi.security_of("owe") == "open"
+    # WPA (1) alone or mixed with WPA2, and WEP, are none of open, wpa2, wpa3.
+    for weak in ("psk", "psk-mixed", "psk-mixed+tkip", "wpa", "wpa-mixed", "wep-open"):
+        assert wifi.security_of(weak) is None
+
+
+def test_a_new_network_uses_wpa3_on_6_ghz_radios(router, cfg):
+    w = router.other["wireless"]["values"]
+    w["radio0"]["band"] = "5g"
+    w["radio1"]["band"] = "6g"
+    apply(cfg, wifi_change(ssid="Guest", password="a-long-password"))
+    new = [s for s in router.other["wireless"]["values"].values() if s.get("ssid") == "Guest"]
+    assert {s["device"]: s["encryption"] for s in new} == {"radio0": "psk2", "radio1": "sae"}
+    # An open access point given a password on a 6 GHz radio gets SAE too.
+    apply(cfg, wifi_change(ssid="Cams", password="a-long-password"))
+    assert router.other["wireless"]["values"]["d"]["encryption"] == "sae"

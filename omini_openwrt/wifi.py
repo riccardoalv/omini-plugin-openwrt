@@ -17,7 +17,18 @@ from typing import Any
 
 from omini_sdk import PluginError
 
-SECURITY = {"none": "open", "owe": "open", "psk2": "wpa2", "psk": "wpa2", "psk-mixed": "wpa2"}
+# OpenWrt's `encryption` (before any "+cipher") → WifiNetwork.security. WPA
+# (1), alone or mixed with WPA2, and WEP are none of these: left empty.
+SECURITY = {
+    "none": "open",
+    "owe": "open",
+    "psk2": "wpa2",
+    "wpa2": "wpa2",
+    "sae": "wpa3",
+    "wpa3": "wpa3",
+    "sae-mixed": "wpa2wpa3",
+    "wpa3-mixed": "wpa2wpa3",
+}
 
 
 def sections(config: Any, kind: str) -> list[dict[str, Any]]:
@@ -27,13 +38,14 @@ def sections(config: Any, kind: str) -> list[dict[str, Any]]:
     return [s for s in values.values() if isinstance(s, dict) and s.get(".type") == kind]
 
 
-def security_of(encryption: Any) -> str:
-    e = str(encryption or "none").split("+")[0]
-    if e.startswith("sae-mixed"):
-        return "wpa2wpa3"
-    if e.startswith("sae"):
-        return "wpa3"
-    return SECURITY.get(e, "wpa2")
+def security_of(encryption: Any) -> str | None:
+    return SECURITY.get(str(encryption or "none").split("+")[0])
+
+
+def encryption_for(radio: dict[str, Any] | None) -> str:
+    """The encryption of a new (or newly secured) access point: WPA3 (sae) on
+    a 6 GHz radio, which requires it; WPA2 (psk2) elsewhere."""
+    return "sae" if str((radio or {}).get("band") or "") == "6g" else "psk2"
 
 
 def networks_of(iface: dict[str, Any]) -> list[str]:
