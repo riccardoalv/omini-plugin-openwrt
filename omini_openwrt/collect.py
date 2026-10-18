@@ -29,11 +29,12 @@ from omini_sdk import (
     WirelessClient,
     log,
 )
-from omini_sdk.models import PortForward
+from omini_sdk.models import PortForward, Radio, RadioChange
 
 from omini_openwrt import backup as bk
 from omini_openwrt import forwards as fwd
 from omini_openwrt import networks as nets
+from omini_openwrt import radios as rad
 from omini_openwrt import services as svc
 from omini_openwrt import vlans as vl
 from omini_openwrt import wifi as wlan
@@ -292,6 +293,9 @@ def read_all(client: Client) -> tuple[dict[str, Any], list[str]]:
     raw["config"] = r.optional("uci", "get", {"config": "network"}, report="uci get network")
     # The Wi-Fi networks and their VLANs (an access point's wireless config).
     raw["wireless"] = r.optional("uci", "get", {"config": "wireless"}, report=None)
+    # Which interfaces run on each radio (their channel and power, from iwinfo).
+    raw["wireless_status"] = r.optional("network.wireless", "status", report=None)
+    raw["radio_info"] = radio_infos(r, raw["wireless"], raw["wireless_status"])
     # A router's networks: their DHCP ranges and fixed addresses, and their access.
     raw["dhcp"] = r.optional("uci", "get", {"config": "dhcp"}, report="uci get dhcp")
     raw["firewall"] = r.optional("uci", "get", {"config": "firewall"}, report="uci get firewall")
@@ -303,6 +307,20 @@ def read_all(client: Client) -> tuple[dict[str, Any], list[str]]:
     raw["arp"] = r.file_read("/proc/net/arp")
     raw["temps"] = read_temperatures(r)
     return raw, r.denied
+
+
+def radio_infos(r: Reader, wireless: Any, status: Any) -> dict[str, Any]:
+    """iwinfo's info of each radio itself, when netifd's wireless status does
+    not say which interfaces run on it."""
+    if isinstance(status, dict):
+        return {}
+    out = {}
+    for s in wlan.sections(wireless, "wifi-device"):
+        name = s.get(".name")
+        info = r.optional("iwinfo", "info", {"device": name}, report=None) if name else None
+        if isinstance(info, dict):
+            out[name] = info
+    return out
 
 
 def read_temperatures(r: Reader) -> list[tuple[str, str | None, str | None]]:
@@ -601,6 +619,11 @@ def build(raw: dict[str, Any], host: str | None) -> Device:
     if raw.get("firewall"):
         found = svc.paused(raw["firewall"])
         extra["paused"] = [PausedDevice(**p) for p in found] if found else None
+    if raw.get("wireless") or raw["wifi"]:
+        infos = {dev: i for dev, i, _ in raw["wifi"]} | (raw.get("radio_info") or {})
+        found = rad.radios(raw.get("wireless"), raw.get("wireless_status"), infos)
+        extra["radios"] = [Radio(**x) for x in found] or None
+        extra["wireless_uplink"] = rad.wireless_uplink(raw.get("wireless"), infos)
     forwards = port_forwards(raw)
     if forwards is not None:
         extra["port_forwards"] = forwards or None
@@ -1029,6 +1052,8 @@ def apply(cfg: Config, change: Change) -> list[Device]:
     port again and confirms only when netifd shows it disabled (or enabled).
     Nothing else in the configuration is touched. Returns the router as read
     after the change."""
+    if change.kind == "wifi.channel":
+        return apply_channel(cfg, change)
     if change.kind in ("wifi.set", "wifi.delete"):
         return apply_wifi(cfg, change)
     if change.kind in ("port.vlans", "vlan.set", "vlan.delete"):
@@ -1182,6 +1207,67 @@ def apply_wifi(cfg: Config, change: Change) -> list[Device]:
             return enabled is None or w["enabled"] == bool(enabled)
 
         commit(c, names, ops, done, f'the Wi-Fi network "{ssid}"')
+    finally:
+        c.close()
+    return collect(cfg)
+
+
+def live_channels(c: Client, radio: str) -> list[int] | None:
+    """The channels iwinfo shows on the radio's interfaces now; None when the
+    radio runs no interface (nothing to read but the configuration)."""
+    try:
+        status = c.call("network.wireless", "status")
+    except UbusError:
+        status = None
+    names = rad.interfaces_of(status, radio)
+    if names == []:
+        return None
+    out = []
+    for name in names or [radio]:
+        try:
+            info = c.call("iwinfo", "info", {"device": name})
+        except UbusError:
+            continue
+        ch = rad.as_int(info.get("channel")) if isinstance(info, dict) else None
+        if ch:
+            out.append(ch)
+    return out
+
+
+def apply_channel(cfg: Config, change: Change) -> list[Device]:
+    """wifi.channel: the radio's `channel` in /etc/config/wireless, staged in
+    this session, applied with rollback (the Wi-Fi restarts on it), confirmed
+    once uci reads it back and iwinfo shows the radio's interfaces on it."""
+    try:
+        value = RadioChange.model_validate(change.value)
+    except ValueError as e:
+        raise PluginError("wifi.channel needs {radio, channel} (a channel from 1 to 233)") from e
+    radio, channel = value.radio, value.channel
+    c = client_from(cfg)
+    try:
+        c.login()
+        wireless = read_configs(c, ["wireless"])["wireless"]
+        section = rad.check_channel(wireless, radio, channel)
+        # A radio that runs interfaces must show them on the new channel (they
+        # vanish for a moment while the Wi-Fi restarts); one that runs none is
+        # read back from the configuration only.
+        runs = live_channels(c, radio) is not None
+
+        def done() -> bool:
+            got = read_configs(c, ["wireless"])["wireless"]
+            mine = next(
+                (s for s in wlan.sections(got, "wifi-device") if s.get(".name") == radio), {}
+            )
+            if rad.configured_channel(mine) != (channel, False):
+                return False
+            live = live_channels(c, radio) or []
+            return not runs or (bool(live) and all(ch == channel for ch in live))
+
+        if rad.configured_channel(section) == (channel, False) and done():
+            return collect(cfg)
+        commit(
+            c, ["wireless"], rad.plan_channel(radio, channel), done, f"channel {channel} on {radio}"
+        )
     finally:
         c.close()
     return collect(cfg)

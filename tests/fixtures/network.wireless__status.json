@@ -1,0 +1,4 @@
+{
+  "radio0": {"up": true, "pending": false, "autostart": true, "disabled": false, "retry_setup_failed": false, "config": {"band": "2g", "channel": "6", "htmode": "HE20", "cell_density": 0}, "interfaces": [{"section": "default_radio0", "ifname": "phy0-ap0", "config": {"mode": "ap", "ssid": "Office", "encryption": "sae-mixed", "network": ["lan"]}, "vlans": [], "stations": []}]},
+  "radio1": {"up": true, "pending": false, "autostart": true, "disabled": false, "retry_setup_failed": false, "config": {"band": "5g", "channel": "auto", "htmode": "HE80"}, "interfaces": [{"section": "default_radio1", "ifname": "phy1-ap0", "config": {"mode": "ap", "ssid": "Office", "network": ["lan"]}, "vlans": [], "stations": []}, {"section": "wwan", "ifname": "phy1-sta0", "config": {"mode": "sta", "ssid": "Upstream", "network": ["wwan"]}, "vlans": [], "stations": []}]}
+}

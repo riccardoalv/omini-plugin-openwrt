@@ -1,6 +1,6 @@
 # omini-plugin-openwrt
 
-[Omini](https://github.com/riccardoalv/omini) plugin for **OpenWrt** routers and access points, through **ubus over HTTP** — the JSON-RPC API LuCI itself uses. It reads the router for the map and can **enable or disable a port**, change the **ports' VLANs**, create and delete **VLANs and their networks** (interface, DHCP range, firewall access), set **fixed addresses**, manage the **Wi-Fi network of each VLAN**, set **local DNS names**, **pause a device's internet** and **wake a device** (Wake-on-LAN); it changes nothing else. It also makes **configuration backups** (the uci files, without secrets).
+[Omini](https://github.com/riccardoalv/omini) plugin for **OpenWrt** routers and access points, through **ubus over HTTP** — the JSON-RPC API LuCI itself uses. It reads the router for the map and can **enable or disable a port**, change the **ports' VLANs**, create and delete **VLANs and their networks** (interface, DHCP range, firewall access), set **fixed addresses**, manage the **Wi-Fi network of each VLAN**, move a **Wi-Fi radio to another channel**, set **local DNS names**, **pause a device's internet** and **wake a device** (Wake-on-LAN); it changes nothing else. It also makes **configuration backups** (the uci files, without secrets).
 
 > **Experimental.** This plugin was built from OpenWrt's documentation and source, not tested on real hardware yet. Reports of what works (and what does not) on your device are very welcome.
 
@@ -15,6 +15,8 @@
 | Host names (from ARP, DHCP, `/etc/ethers`) and IPv6 addresses | `luci-rpc getHostHints` | Names of the devices behind the router, IPv6 neighbors (NDP) |
 | DHCP leases, IPv4 and DHCPv6 (odhcpd: the MAC from `macaddr`, else from a DUID-LLT or DUID-LL; a lease whose DUID holds no MAC is left out) | `luci-rpc getDHCPLeases` | Names and addresses of clients |
 | Wi-Fi networks (SSID, band) and **clients** with signal and link rates | `iwinfo devices`, `iwinfo info`, `iwinfo assoclist` | Wi-Fi clients on the map |
+| Wi-Fi **radios**: band (`band`, or `hwmode` before 21.02), channel (`channel`, or `auto`), width (`htmode`), on or off (`config wifi-device`); the channel they are on and the transmit power (iwinfo, through each radio's interfaces) | `uci get` of the `wireless` config, `network.wireless status`, `iwinfo info` | Wi-Fi channels (optional) |
+| A **wireless uplink**: a `config wifi-iface` in mode `sta` (repeater, Wi-Fi WAN) or `mesh` that is on; without the config, an interface iwinfo shows in Client or Mesh Point mode | `uci get` of the `wireless` config, `iwinfo info` | Mesh units and repeaters are never moved to another channel |
 | Which ports are disabled (`config device` sections with `enabled '0'`), the VLANs' names (`config bridge-vlan`), the interfaces and their addresses | `uci get` of the `network` config | Ports shown as "Disabled", VLANs, networks |
 | Each network's DHCP range and the fixed addresses (`config dhcp`, `config host`) | `uci get` of the `dhcp` config | Networks, reservations (routers) |
 | Each network's access (its firewall zone, rules and forwardings) | `uci get` of the `firewall` config | Networks (routers) |
@@ -44,6 +46,10 @@ Every method but `system board` is optional: when the ACL refuses it, or the dev
 A disabled port is down for netifd (it leaves it out of the bridge), stays down after a reboot, and appears as **Disabled** on the map. The plugin refuses the switch's CPU port (`eth0` on most routers, which carries every LAN port), bridges, VLANs and Wi-Fi interfaces, and routers whose switch uses **swconfig** (older devices with `config switch` sections), where ports are not separate devices.
 
 **Wi-Fi per VLAN** (`wifi.set`, `wifi.delete`) works the same way on `/etc/config/wireless`: the access point of each radio is added, changed (name, network, password, on or off) or deleted, applied with rollback, read again (the name, the VLAN and on or off as asked) and confirmed, else rolled back. A VLAN with no interface on the router gets one (a `bridge-vlan` tagged on the ports VLAN 1 has, and an unmanaged interface on it) only when the bridge already filters VLANs; otherwise the plugin asks to turn bridge VLAN filtering on in LuCI first. The password is written to the router only.
+
+### Wi-Fi channels (`wifi.channel`)
+
+`wifi.channel` `{radio, channel}` moves one radio (`radio0`, as collect names it) to a fixed channel: `uci set` `{"config": "wireless", "section": "radio0", "values": {"channel": "11"}}`, nothing else of the radio, applied with rollback (the Wi-Fi restarts on it, and its clients reconnect), read back from `/etc/config/wireless` and from iwinfo (every interface netifd runs on the radio must show the new channel), then confirmed; else rolled back. A radio that is off, an unknown radio, and a channel outside the radio's band (2.4 GHz: 1-14, 5 GHz: 32-177, 6 GHz: 1-233) are refused. Omini asks it only for radios on a fixed channel and never for a device with a wireless uplink (decided in Omini's core); the plugin applies what it is asked. The same `wireless` write access as Wi-Fi networks is enough.
 
 ### VLANs of the ports (`port.vlans`, `vlan.set`, `vlan.delete`)
 
@@ -135,6 +141,7 @@ rpcd logins are not system users: each is an entry in `/etc/config/rpcd` that ma
            "system": ["board", "info"],
            "network.device": ["status"],
            "network.interface": ["dump"],
+           "network.wireless": ["status"],
            "luci-rpc": ["getHostHints", "getDHCPLeases"],
            "iwinfo": ["devices", "info", "assoclist"],
            "file": ["read", "list"],
@@ -230,6 +237,7 @@ Built from documentation without hardware, so:
 - **Wi-Fi traffic** per client: iwinfo gives byte counters, not current rates, so clients carry link rates and signal but no ↓/↑ traffic.
 - A WAN that is **down** is recognized only by OpenWrt's naming convention (`wan`, `wan6`, `wanb`...) with an uplink protocol (DHCP, PPPoE, static...).
 - **Not verified on hardware** (IPv6): `getDHCPLeases`'s `dhcp6_leases` fields (`duid`, `ip6addr`, `ip6addrs` with or without a prefix length, `macaddr` on recent LuCI) and odhcpd's `local-address` of a prefix assignment.
+- **Not verified on hardware** (Wi-Fi radios): `network.wireless status` listing each radio's `interfaces[].ifname`; `iwinfo info` of a radio name (`radio0`) when that status is not allowed; `txpower` in dBm; the time the Wi-Fi takes to restart on a new channel (the plugin waits up to 15 s; a DFS channel on 5 GHz may take a minute of channel check and be rolled back).
 - **Not verified on hardware** (port forwards): `luci.upnp get_status` answering `{rules: [{proto, extport, intaddr, intport, description}]}` (luci-app-upnp's rpcd plugin); the lease file at `/var/run/miniupnpd.leases` (miniupnpd's `upnp_lease_file` default on OpenWrt) with lines `PROTO:EXT_PORT:INT_IP:INT_PORT[:TIMESTAMP]:DESCRIPTION`; IPv6 pinholes are not read. The WAN interface of a forward is left empty (a redirect names a zone, not an interface).
 - **Not verified on hardware** (DNS, pause, Wake-on-LAN, backups, LAGs): `rpcd`'s `file stat` needing the path's `list` permission (if your rpcd checks another one, the plugin goes on to `file exec` without the check); `file exec` answering `{code, stdout, stderr}` and status 4 for a missing program; fw4 accepting the `omini` list on a rule (fw4 ignores options it does not know) and `list src_mac` with `family any` matching routed IPv4 and IPv6 traffic in the forward chain; `config device` type `bonding` with `ports` and proto-bonding's `slaves` / `bonding-<interface>` device name; rpcd's `.index` on sections.
 - **Pausing** blocks new connections only: fw4 accepts established connections before the zone rules, and cutting them (conntrack) needs a program the ACL does not run, so a download already running goes on until it ends. A rule placed before Omini's in the file that accepts that traffic (e.g. a custom LAN-to-WAN accept) wins; the plugin cannot reorder rules.

@@ -11,7 +11,8 @@ description: >-
   disks, temperatures and uptime (IPv4 and IPv6: addresses, neighbors, DHCPv6
   leases, default routes, AAAA names), and each VLAN's network (interface, DHCP
   range, firewall access, fixed addresses) and the port forwards (firewall
-  redirects and UPnP mappings). It enables or disables ports,
+  redirects and UPnP mappings), and each radio's channel. It enables or disables
+  ports, moves a Wi-Fi radio to another channel,
   changes the ports' VLANs (bridge VLAN filtering), creates and deletes VLANs
   and their networks, sets fixed addresses and manages the Wi-Fi networks of
   each VLAN, local DNS names (dnsmasq) and paused devices (fw4 rules by
@@ -35,6 +36,7 @@ changes:
   - wol.send
   - pause.set
   - pause.delete
+  - wifi.channel
 backup: true
 fields:
   - key: url
