@@ -60,18 +60,34 @@ def ipv4(value: Any) -> str | None:
         return None
 
 
-def dns_records(dhcp: Any) -> list[dict[str, str]]:
-    """Every `config domain` with a name and an IPv4 address (A records only)."""
+def ipv6(value: Any) -> str | None:
+    try:
+        return str(ipaddress.IPv6Address(str(value or "").strip()))
+    except ValueError:
+        return None
+
+
+def dns_records(dhcp: Any, aaaa: bool = False) -> list[dict[str, str]]:
+    """Every `config domain` with a name and an IPv4 address (A records), and
+    with `aaaa` the IPv6 ones (AAAA records, reported but never changed)."""
     out = []
     for s in sections(dhcp, "domain"):
         name, ip = dns_name(s.get("name")), ipv4(s.get("ip"))
+        if ip is None and aaaa:
+            ip = ipv6(s.get("ip"))
         if name and ip and {"name": name, "ip": ip} not in out:
             out.append({"name": name, "ip": ip})
     return sorted(out, key=lambda r: (r["name"], r["ip"]))
 
 
 def _named(dhcp: Any, name: str) -> list[dict[str, Any]]:
-    return [s for s in sections(dhcp, "domain") if dns_name(s.get("name")) == name]
+    """The name's sections Omini may change: never an IPv6 (AAAA) one, which
+    devices or the user made."""
+    return [
+        s
+        for s in sections(dhcp, "domain")
+        if dns_name(s.get("name")) == name and ipv6(s.get("ip")) is None
+    ]
 
 
 def plan_dns_set(dhcp: Any, value: dict[str, Any]) -> list[Op]:

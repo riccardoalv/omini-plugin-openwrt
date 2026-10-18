@@ -191,6 +191,25 @@ def addresses(iface: dict[str, Any]) -> list[str]:
     return out
 
 
+def own_addresses(li: dict[str, Any]) -> list[str]:
+    """A logical interface's own addresses: IPv4, and IPv6 but link-local
+    (the WAN's, and the router's address in each delegated LAN prefix)."""
+    out = [a["address"] for a in li.get("ipv4-address") or [] if isinstance(a.get("address"), str)]
+    v6 = [a.get("address") for a in li.get("ipv6-address") or [] if isinstance(a, dict)]
+    for p in li.get("ipv6-prefix-assignment") or []:
+        local = p.get("local-address") if isinstance(p, dict) else None
+        if isinstance(local, dict):
+            v6.append(local.get("address"))
+    for a in v6:
+        try:
+            ip = ipaddress.IPv6Address(str(a))
+        except ValueError:
+            continue
+        if not ip.is_link_local and str(ip) not in out:
+            out.append(str(ip))
+    return out
+
+
 def subnet_of(cidrs: list[str]) -> str | None:
     for c in cidrs:
         try:
@@ -439,9 +458,7 @@ def build(raw: dict[str, Any], host: str | None) -> Device:
         names_on.setdefault(l3, []).append(name)
         cidrs = addresses(li)
         ips_on.setdefault(l3, []).extend(c for c in cidrs if c not in ips_on[l3])
-        device_ips += [
-            a["address"] for a in li.get("ipv4-address") or [] if isinstance(a.get("address"), str)
-        ]
+        device_ips += own_addresses(li)
         dev = li.get("device")
         if isinstance(dev, str) and dev != l3:
             parent_of[l3] = dev  # pppoe-wan runs on eth1 (or a VLAN of it)
@@ -578,7 +595,7 @@ def build(raw: dict[str, Any], host: str | None) -> Device:
     if gateways and raw.get("config"):
         extra.update(router_networks(raw, wan_names(raw["interfaces"], raw.get("firewall"))))
     if raw.get("dhcp"):
-        records = svc.dns_records(raw["dhcp"])
+        records = svc.dns_records(raw["dhcp"], aaaa=True)
         extra["dns_records"] = [DnsRecord(**r) for r in records] or None
         extra["dns_domain"] = svc.dns_domain(raw["dhcp"])
     if raw.get("firewall"):
@@ -759,6 +776,40 @@ def parse_arp(text: str) -> list[ArpEntry]:
     return out
 
 
+def mac_of_duid(duid: Any) -> str | None:
+    """The MAC inside a DHCPv6 client's DUID, when it carries one: DUID-LLT
+    (type 1) or DUID-LL (type 3) of an Ethernet (hardware type 1) address."""
+    if not isinstance(duid, str):
+        return None
+    h = duid.strip().lower().replace(":", "")
+    if not re.fullmatch(r"[0-9a-f]+", h):
+        return None
+    if h.startswith("00010001") and len(h) == 28:
+        raw = h[16:]
+    elif h.startswith("00030001") and len(h) == 20:
+        raw = h[8:]
+    else:
+        return None
+    return norm_mac(":".join(raw[i : i + 2] for i in range(0, 12, 2)))
+
+
+def lease6_addresses(row: dict[str, Any]) -> list[str]:
+    """A DHCPv6 lease's addresses (`ip6addrs`, else `ip6addr`), without the
+    prefix length LuCI may add."""
+    found = row.get("ip6addrs")
+    if not isinstance(found, list):
+        found = [row.get("ip6addr")]
+    out = []
+    for a in found:
+        try:
+            ip = str(ipaddress.IPv6Address(str(a or "").split("/")[0].strip()))
+        except ValueError:
+            continue
+        if ip not in out:
+            out.append(ip)
+    return out
+
+
 def map_leases_and_hosts(
     leases_raw: Any, hints_raw: Any
 ) -> tuple[list[DhcpLease] | None, list[Host] | None]:
@@ -784,6 +835,25 @@ def map_leases_and_hosts(
                 expires_at=now + timedelta(seconds=secs) if secs and secs > 0 else None,
             )
         )
+
+    rows6 = leases_raw.get("dhcp6_leases") if isinstance(leases_raw, dict) else None
+    for row in rows6 or []:
+        if not isinstance(row, dict):
+            continue
+        mac = norm_mac(row.get("macaddr")) or mac_of_duid(row.get("duid"))
+        if not mac:
+            continue
+        name = row.get("hostname") if isinstance(row.get("hostname"), str) else None
+        secs = as_int(row.get("expires"))
+        for ip in lease6_addresses(row):
+            leases.append(
+                DhcpLease(
+                    ip=ip,
+                    mac=mac,
+                    hostname=name or None,
+                    expires_at=now + timedelta(seconds=secs) if secs and secs > 0 else None,
+                )
+            )
 
     hosts = []
     for raw_mac, hint in (hints_raw or {}).items() if isinstance(hints_raw, dict) else []:

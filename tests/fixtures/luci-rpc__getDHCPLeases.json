@@ -4,5 +4,9 @@
     {"expires": 600, "hostname": "phone", "macaddr": "AA:BB:CC:DD:EE:02", "ipaddr": "192.168.1.60"},
     {"expires": false, "macaddr": "aa:bb:cc:dd:ee:04", "ipaddr": "192.168.1.70"}
   ],
-  "dhcp6_leases": []
+  "dhcp6_leases": [
+    {"expires": 3600, "hostname": "laptop", "duid": "00010001298a7c10aabbccddee01", "ip6addr": "fd12:3456:789a::5c/128", "ip6addrs": ["fd12:3456:789a::5c/128", "2001:db8:1::5c/128"]},
+    {"expires": 1800, "hostname": "nas", "duid": "00030001aabbccddee05", "macaddr": "aa:bb:cc:dd:ee:05", "ip6addr": "fd12:3456:789a::20"},
+    {"expires": 1800, "duid": "0004c0ffee00c0ffee00c0ffee00c0ffee00", "ip6addr": "fd12:3456:789a::99"}
+  ]
 }

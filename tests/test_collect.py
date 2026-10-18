@@ -21,7 +21,14 @@ def test_reads_the_router(openwrt, cfg):
     assert dev.swap_pct is None  # no swap
     assert dev.load_avg == [0.5, 0.25, 0.1]  # divided by 65536
     assert dev.cpu_pct is None  # ubus has no CPU usage
-    assert dev.ips == ["192.168.1.1", "10.0.20.1", "203.0.113.10"]  # no loopback
+    # No loopback and no link-local; the router's address in the LAN's prefix.
+    assert dev.ips == [
+        "192.168.1.1",
+        "fd12:3456:789a::1",
+        "10.0.20.1",
+        "203.0.113.10",
+        "2001:db8::10",
+    ]
     assert [(s.mount, s.total_bytes, s.used_bytes) for s in dev.storage] == [
         ("/", 7168 * 1024, 2048 * 1024),
         ("/tmp", 524288 * 1024, 4096 * 1024),
@@ -126,6 +133,11 @@ def test_arp_leases_and_hosts(openwrt, cfg):
         ("192.168.1.50", "aa:bb:cc:dd:ee:01", "laptop"),
         ("192.168.1.60", "aa:bb:cc:dd:ee:02", "phone"),
         ("192.168.1.70", "aa:bb:cc:dd:ee:04", None),
+        # DHCPv6 (odhcpd): the MAC from macaddr or from a DUID-LLT / DUID-LL; one
+        # whose DUID carries no MAC (DUID-UUID) is left out.
+        ("fd12:3456:789a::5c", "aa:bb:cc:dd:ee:01", "laptop"),
+        ("2001:db8:1::5c", "aa:bb:cc:dd:ee:01", "laptop"),
+        ("fd12:3456:789a::20", "aa:bb:cc:dd:ee:05", "nas"),
     ]
     assert dev.dhcp_leases[0].expires_at is not None
     assert dev.dhcp_leases[2].expires_at is None  # unknown / infinite
@@ -339,3 +351,13 @@ def test_memory_in_bytes_and_ipv6_neighbors(openwrt, cfg):
         ("fe80::1", "aa:bb:cc:dd:ee:01"),
         ("fd12:3456:789a::3", "aa:bb:cc:dd:ee:03"),
     ]
+
+
+def test_the_mac_of_a_duid():
+    from omini_openwrt.collect import mac_of_duid
+
+    assert mac_of_duid("00:01:00:01:29:8a:7c:10:aa:bb:cc:dd:ee:01") == "aa:bb:cc:dd:ee:01"
+    assert mac_of_duid("00030001AABBCCDDEE05") == "aa:bb:cc:dd:ee:05"
+    assert mac_of_duid("0002000000090c4c0123456789") is None  # DUID-EN: no MAC
+    assert mac_of_duid("00010006298a7c10aabbccddee01") is None  # not Ethernet
+    assert mac_of_duid(None) is None

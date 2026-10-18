@@ -38,8 +38,21 @@ def test_reads_the_local_domain_and_names(openwrt, cfg):
     openwrt.other["dhcp"]["values"]["cfg06"] = sec("cfg06", "domain", name="v6.lan", ip="fd00::1")
     dev = collect(cfg)[0]
     assert dev.dns_domain == "lan"
-    # A records only, lowercase.
-    assert [(r.name, r.ip) for r in dev.dns_records] == [("nas.lan", "192.168.1.20")]
+    # Lowercase; AAAA records others made are reported too.
+    assert [(r.name, r.ip) for r in dev.dns_records] == [
+        ("nas.lan", "192.168.1.20"),
+        ("v6.lan", "fd00::1"),
+    ]
+
+
+def test_dns_changes_never_touch_an_aaaa_record(openwrt, cfg):
+    values = openwrt.other["dhcp"]["values"]
+    values["cfg05"] = sec("cfg05", "domain", name="nas.lan", ip="fd00::20")
+    apply(cfg, change("dns.set", {"name": "nas.lan", "ip": "192.168.1.20"}))
+    assert sorted(domains(openwrt)) == [("nas.lan", "192.168.1.20"), ("nas.lan", "fd00::20")]
+    dev = apply(cfg, change("dns.delete", {"name": "nas.lan"}))[0]
+    assert domains(openwrt) == [("nas.lan", "fd00::20")]
+    assert [(r.name, r.ip) for r in dev.dns_records] == [("nas.lan", "fd00::20")]
 
 
 def test_sets_changes_and_deletes_a_name(openwrt, cfg):
