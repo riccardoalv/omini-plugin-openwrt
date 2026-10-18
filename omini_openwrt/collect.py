@@ -1033,18 +1033,15 @@ def stage_wifi(
 ) -> None:
     """The uci writes of a wifi.set: the VLAN's interface when missing, then
     each radio's access point."""
-    iface = None
-    if value.get("vlan") is not None or not aps:
-        iface, writes = wlan.plan_interface(network, int(value.get("vlan") or 1))
-        for kind, values in writes:
-            name = values.pop("name", None)
-            args: dict[str, Any] = {"config": "network", "type": kind, "values": values}
-            if name:
-                args["name"] = name
-            _write(c, "add", args)
-    options: dict[str, Any] = {"ssid": str(value["ssid"])}
-    if iface:
-        options["network"] = iface
+    # No VLAN is the untagged LAN (VLAN 1): an existing network moves back to it.
+    iface, writes = wlan.plan_interface(network, int(value.get("vlan") or 1))
+    for kind, values in writes:
+        name = values.pop("name", None)
+        args: dict[str, Any] = {"config": "network", "type": kind, "values": values}
+        if name:
+            args["name"] = name
+        _write(c, "add", args)
+    options: dict[str, Any] = {"ssid": str(value["ssid"]), "network": iface}
     if value.get("password"):
         options["key"] = str(value["password"])
     if value.get("enabled") is not None:

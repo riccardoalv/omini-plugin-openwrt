@@ -157,3 +157,8 @@ def test_a_new_network_uses_wpa3_on_6_ghz_radios(router, cfg):
     # An open access point given a password on a 6 GHz radio gets SAE too.
     apply(cfg, wifi_change(ssid="Cams", password="a-long-password"))
     assert router.other["wireless"]["values"]["d"]["encryption"] == "sae"
+
+
+def test_no_vlan_moves_the_network_back_to_the_lan(router, cfg):
+    apply(cfg, wifi_change(ssid="Things", vlan=None))  # it was on iot (VLAN 30)
+    assert aps(router)["c"]["network"] == "lan"
