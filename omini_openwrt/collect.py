@@ -809,6 +809,14 @@ WRITE_ACL = (
 )
 
 
+def read_acl(config: str) -> str:
+    """What the ACL needs to read one uci config."""
+    return (
+        f'it needs "read": {{"ubus": {{"uci": ["get"]}}, "uci": ["{config}"]}} '
+        "in its ACL file (see the plugin's README)"
+    )
+
+
 def _write(c: Client, method: str, args: dict[str, Any]) -> Any:
     """A uci call that changes the configuration; a refusal names the ACL."""
     try:
@@ -888,8 +896,7 @@ def apply(cfg: Config, change: Change) -> list[Device]:
         except AccessDenied as e:
             raise PluginError(
                 f"the ACL of user {c.username!r} does not allow ubus uci get on the network "
-                'config: it needs "read": {"ubus": {"uci": ["get"]}, "uci": ["network"]} '
-                "in its ACL file (see the plugin's README)"
+                "config: " + read_acl("network")
             ) from e
         check_port(devices, config, port)
         if (port not in disabled_ports(config)) == value:
@@ -1099,7 +1106,7 @@ def read_configs(c: Client, names: list[str]) -> dict[str, Any]:
         except AccessDenied as e:
             raise PluginError(
                 f"the ACL of user {c.username!r} does not allow reading the {name} config: "
-                + WRITE_ACL
+                + read_acl(name)
             ) from e
         except UbusError as e:
             raise PluginError(f"OpenWrt did not answer uci get {name}: {e}") from e

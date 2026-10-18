@@ -283,3 +283,14 @@ def test_reservations(router, cfg):
     devices = apply(cfg, change("reservation.delete", {"mac": "aa:bb:cc:00:00:02"}))
     assert devices[0].dhcp_reservations is None
     assert router.other["dhcp"] == DHCP and router.confirmed == 3
+
+
+def test_a_refused_read_names_the_read_acl(openwrt, cfg):
+    openwrt.denied.add("uci get")
+    value = {"mac": "aa:bb:cc:dd:ee:ff"}
+    with pytest.raises(PluginError) as e:
+        apply(cfg, Change(device="x", kind="reservation.delete", value=value))
+    msg = str(e.value)
+    assert "does not allow reading the dhcp config" in msg
+    assert '"read": {"ubus": {"uci": ["get"]}, "uci": ["dhcp"]}' in msg
+    assert "write" not in msg
