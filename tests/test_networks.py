@@ -294,3 +294,14 @@ def test_a_refused_read_names_the_read_acl(openwrt, cfg):
     assert "does not allow reading the dhcp config" in msg
     assert '"read": {"ubus": {"uci": ["get"]}, "uci": ["dhcp"]}' in msg
     assert "write" not in msg
+
+
+def test_new_zone_and_interface_names_are_never_taken():
+    network = {"values": {"vlan30": sec("vlan30", "interface", False, device="br-lan.40")}}
+    firewall = {"values": {"z": sec("z", "zone", name="guest", network=["other"])}}
+    # "Guest" is a zone already, vlan30 an interface on another VLAN.
+    assert nets.new_ifname(network, firewall, 30, "Guest") == "vlan30_2"
+    # A network without a zone of its own gets one whose name is free.
+    ops = nets.plan_access(firewall, "guest", "local", set(), "Guest", 30)
+    zone = next(args for m, args in ops if m == "add" and args["type"] == "zone")
+    assert zone["values"]["name"] == "vlan30" and zone["values"]["network"] == ["guest"]

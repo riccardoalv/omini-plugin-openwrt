@@ -229,9 +229,15 @@ def new_ifname(network: Any, firewall: Any, vid: int, name: str) -> str:
     slug = re.sub(r"[^a-z0-9_]+", "_", name.lower()).strip("_")[:11]
     taken = {str(s.get(".name")) for s in sections(network, "interface")}
     taken |= {str(z.get("name")) for z in sections(firewall, "zone")}
-    if slug and not slug[0].isdigit() and slug not in taken:
-        return slug
-    return f"vlan{vid}"
+    return free_name(taken, slug if slug and not slug[0].isdigit() else None, vid)
+
+
+def free_name(taken: set[str], first: str | None, vid: int) -> str:
+    """first when it is free, else vlanN, vlanN_2... (11 characters at most)."""
+    for name in (first, f"vlan{vid}", *(f"vlan{vid}_{n}" for n in range(2, 10))):
+        if name and name not in taken:
+            return name
+    raise PluginError(f"no free name for the network of VLAN {vid}: rename one in LuCI")
 
 
 def plan_device(network: Any, vid: int, parent: str, wans: set[str]) -> tuple[str, list[Op]]:
@@ -372,7 +378,8 @@ def plan_access(
             "only a zone of its own; change its rules in LuCI or keep the access Custom"
         )
     if z is None:
-        name = ifname if len(ifname) <= 11 else f"vlan{vid}"
+        zones = {str(s.get("name")) for s in sections(firewall, "zone")}
+        name = free_name(zones, ifname if len(ifname) <= 11 else None, vid)
         policy, writes = preset(access, name, wan, label)
         ops.append(add("firewall", "zone", {"name": name, "network": [ifname], **policy}))
         return ops + writes
