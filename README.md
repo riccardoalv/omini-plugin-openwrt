@@ -12,7 +12,7 @@
 | Uptime, memory, swap, load, overlay (`/`) and `/tmp` usage | `system info` | Device health |
 | Ports: status (carrier), **link speed / duplex** (`1000F`), MAC, traffic and error counters, bridge members, bridge VLANs (DSA) | `network.device status` | Ports on the map, link speed, traffic, VLANs |
 | Logical interfaces (lan, wan...): IPs, default route (off the LAN side, below) → **WAN** with its gateway; PPPoE links on their port | `network.interface dump` | WAN nodes, IPs of the ports, router or AP |
-| Host names (from ARP, DHCP, `/etc/ethers`) | `luci-rpc getHostHints` | Names of the devices behind the router |
+| Host names (from ARP, DHCP, `/etc/ethers`) and IPv6 addresses | `luci-rpc getHostHints` | Names of the devices behind the router, IPv6 neighbors (NDP) |
 | DHCP leases | `luci-rpc getDHCPLeases` | Names and addresses of clients |
 | Wi-Fi networks (SSID, band) and **clients** with signal and link rates | `iwinfo devices`, `iwinfo info`, `iwinfo assoclist` | Wi-Fi clients on the map |
 | Which ports are disabled (`config device` sections with `enabled '0'`), the VLANs' names (`config bridge-vlan`), the interfaces and their addresses | `uci get` of the `network` config | Ports shown as "Disabled", VLANs, networks |

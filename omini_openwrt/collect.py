@@ -559,6 +559,7 @@ def build(raw: dict[str, Any], host: str | None) -> Device:
     ).strip()
 
     mem = info.get("memory") if isinstance(info.get("memory"), dict) else {}
+    mem_total, mem_used = mem_bytes(mem)
     swap = info.get("swap") if isinstance(info.get("swap"), dict) else {}
     load = [round(v / 65536, 2) for v in info.get("load") or [] if isinstance(v, int)][:3]
 
@@ -586,6 +587,8 @@ def build(raw: dict[str, Any], host: str | None) -> Device:
         os_version=os_version or None,
         uptime_s=counter(info.get("uptime")),
         mem_pct=mem_pct(mem),
+        mem_total_bytes=mem_total,
+        mem_used_bytes=mem_used,
         swap_pct=pct_used(swap.get("total"), swap.get("free")),
         load_avg=load or None,
         temperatures=map_temperatures(raw["temps"]) or None,
@@ -594,6 +597,7 @@ def build(raw: dict[str, Any], host: str | None) -> Device:
         ips=list(dict.fromkeys(device_ips)) or None,
         interfaces=interfaces or None,
         arp=parse_arp(raw["arp"]) if raw["arp"] else None,
+        ndp=map_ndp(raw["hints"]),
         dhcp_leases=leases,
         wireless_clients=wireless,
         gateways=gateways or None,
@@ -641,14 +645,43 @@ def pct_used(total: Any, free: Any) -> float | None:
     return round(min(100.0, max(0.0, (t - f) * 100 / t)), 1)
 
 
-def mem_pct(mem: dict[str, Any]) -> float | None:
+def mem_available(mem: dict[str, Any]) -> int | None:
     available = as_int(mem.get("available"))
     if available is None:
         parts = [as_int(mem.get(k)) for k in ("free", "buffered", "cached")]
         if parts[0] is None:
             return None
         available = sum(p or 0 for p in parts)
-    return pct_used(mem.get("total"), available)
+    return available
+
+
+def mem_pct(mem: dict[str, Any]) -> float | None:
+    return pct_used(mem.get("total"), mem_available(mem))
+
+
+def mem_bytes(mem: dict[str, Any]) -> tuple[int | None, int | None]:
+    """procd's memory sizes are in bytes: (total, used = total - available)."""
+    total, available = as_int(mem.get("total")), mem_available(mem)
+    if not total or total <= 0:
+        return None, None
+    used = total - available if available is not None and 0 <= available <= total else None
+    return total, used
+
+
+def map_ndp(hints_raw: Any) -> list[ArpEntry] | None:
+    """IPv6 neighbors: the ip6addrs getHostHints lists for each MAC."""
+    out = []
+    for raw_mac, hint in (hints_raw or {}).items() if isinstance(hints_raw, dict) else []:
+        mac = norm_mac(raw_mac)
+        if not mac or not isinstance(hint, dict):
+            continue
+        for ip in hint.get("ip6addrs") or []:
+            try:
+                if isinstance(ip, str) and ipaddress.ip_address(ip).version == 6:
+                    out.append(ArpEntry(ip=ip, mac=mac))
+            except ValueError:
+                continue
+    return out or None
 
 
 def map_storage(info: dict[str, Any]) -> list[Storage]:

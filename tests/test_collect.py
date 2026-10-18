@@ -329,3 +329,13 @@ def test_an_8021q_device_reports_its_vid(openwrt, cfg):
     [dev] = collect(cfg)
     cams = next(i for i in dev.interfaces if i.name == "cams")
     assert (cams.type, cams.vlan, cams.parent) == ("vlan", 40, "eth1")
+
+
+def test_memory_in_bytes_and_ipv6_neighbors(openwrt, cfg):
+    [dev] = collect(cfg)
+    assert (dev.mem_total_bytes, dev.mem_used_bytes) == (1073741824, 1073741824 - 805306368)
+    # getHostHints' ip6addrs: which MAC each IPv6 address belongs to.
+    assert [(n.ip, n.mac) for n in dev.ndp] == [
+        ("fe80::1", "aa:bb:cc:dd:ee:01"),
+        ("fd12:3456:789a::3", "aa:bb:cc:dd:ee:03"),
+    ]
