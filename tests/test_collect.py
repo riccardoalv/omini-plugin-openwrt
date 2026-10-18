@@ -307,3 +307,25 @@ def test_a_default_route_in_the_wan_zone_is_a_wan(openwrt, cfg):
     zones["cfg03dc81"]["network"] = ["lan"]
     [dev] = collect(cfg)
     assert dev.role == "router" and [g.name for g in dev.gateways] == ["lan"]
+
+
+def test_an_8021q_device_reports_its_vid(openwrt, cfg):
+    # A VLAN device named in LuCI (not <port>.<vid>): its VLAN is its vid.
+    openwrt.routes[("network.device", "status")]["cams"] = {
+        "present": True,
+        "type": "8021q",
+        "devtype": "vlan",
+        "up": True,
+    }
+    openwrt.network["values"]["cfg090f15"] = {
+        ".anonymous": True,
+        ".type": "device",
+        ".name": "cfg090f15",
+        "name": "cams",
+        "type": "8021q",
+        "ifname": "eth1",
+        "vid": "40",
+    }
+    [dev] = collect(cfg)
+    cams = next(i for i in dev.interfaces if i.name == "cams")
+    assert (cams.type, cams.vlan, cams.parent) == ("vlan", 40, "eth1")

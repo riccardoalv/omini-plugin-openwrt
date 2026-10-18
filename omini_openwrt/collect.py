@@ -313,10 +313,16 @@ def iface_type(name: str, st: dict[str, Any]) -> str | None:
     return "other" if st.get("devtype") else None
 
 
-def vlan_of(name: str) -> tuple[str | None, int | None]:
+def vlan_of(name: str, config: Any = None) -> tuple[str | None, int | None]:
+    """A VLAN device's parent and VLAN: from its name (eth1.30, br-lan.30),
+    else from its `config device` of type 8021q (`ifname`, `vid`)."""
     base, _, vid = name.rpartition(".")
     if base and vid.isdigit() and 1 <= int(vid) <= 4094:
         return base, int(vid)
+    for s in config_sections(config, "device"):
+        n = as_int(s.get("vid")) or 0
+        if s.get("name") == name and s.get("type") in ("8021q", "8021ad") and 1 <= n <= 4094:
+            return (str(s.get("ifname") or "") or None), n
     return None, None
 
 
@@ -478,7 +484,7 @@ def build(raw: dict[str, Any], host: str | None) -> Device:
         if kind == "ethernet" and name not in cpu_ports:
             enabled = name not in disabled
         stats = st.get("statistics") if isinstance(st.get("statistics"), dict) else {}
-        parent, vid = vlan_of(name) if kind == "vlan" else (None, None)
+        parent, vid = vlan_of(name, raw.get("config")) if kind == "vlan" else (None, None)
         members = st.get("bridge-members") or lags.get(name)
         interfaces.append(
             Interface(
