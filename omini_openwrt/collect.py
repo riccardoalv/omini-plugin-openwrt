@@ -1051,9 +1051,12 @@ def stage_wifi(
         options["disabled"] = "0" if value["enabled"] else "1"
     if aps:
         for s in aps:
+            # Each access point keeps its own encryption; only an open one
+            # gets one with the password.
+            mine = dict(options)
             if value.get("password") and str(s.get("encryption") or "none") in ("none", "owe"):
-                options["encryption"] = "psk2"
-            _write(c, "set", {"config": "wireless", "section": s[".name"], "values": options})
+                mine["encryption"] = "psk2"
+            _write(c, "set", {"config": "wireless", "section": s[".name"], "values": mine})
         return
     if not value.get("password"):
         raise PluginError("a new Wi-Fi network needs a password")

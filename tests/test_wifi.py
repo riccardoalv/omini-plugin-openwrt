@@ -1,7 +1,11 @@
-import pytest
-from omini_sdk import PluginError
+import copy
 
+import pytest
+from omini_sdk import Change, PluginError
+
+import omini_openwrt.collect as collect_module
 from omini_openwrt import wifi
+from omini_openwrt.collect import apply
 
 
 def config(*sections):
@@ -100,3 +104,33 @@ def test_a_bridge_that_does_not_filter_vlans_is_left_alone():
     plain = config({".name": "lan", ".type": "interface", "device": "br-lan"})
     with pytest.raises(PluginError, match="Bridge VLAN filtering"):
         wifi.plan_interface(plain, 50)
+
+
+# --- wifi.set and wifi.delete on the fake router ----------------------------
+
+
+@pytest.fixture
+def router(openwrt, monkeypatch):
+    monkeypatch.setattr(collect_module, "VERIFY_S", 0)
+    monkeypatch.setattr(collect_module, "VERIFY_PAUSE_S", 0)
+    openwrt.other["wireless"] = copy.deepcopy(WIRELESS)
+    return openwrt
+
+
+def wifi_change(kind="wifi.set", **value):
+    return Change(device="94:83:c4:00:00:01", kind=kind, value=value)
+
+
+def aps(openwrt):
+    return {k: v for k, v in openwrt.other["wireless"]["values"].items() if k in "abcde"}
+
+
+def test_a_password_secures_only_the_open_access_points(router, cfg):
+    w = router.other["wireless"]["values"]
+    w["a"]["encryption"] = "none"  # Home on radio0 was open; radio1's is WPA3 (sae)
+    w["b"]["encryption"] = "sae"
+    apply(cfg, wifi_change(ssid="Home", password="a-long-password"))
+    got = aps(router)
+    assert got["a"]["encryption"] == "psk2"
+    assert got["b"]["encryption"] == "sae"  # not downgraded by the open one before it
+    assert got["a"]["key"] == got["b"]["key"] == "a-long-password"
