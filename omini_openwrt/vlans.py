@@ -26,6 +26,40 @@ from omini_openwrt.wifi import sections
 Op = tuple[str, dict[str, Any]]
 
 
+def vlan_id(value: Any, key: str, kind: str) -> int:
+    """The VLAN id of a change's value, 1 to 4094."""
+    raw = value.get(key) if isinstance(value, dict) else None
+    try:
+        vid = int(raw) if raw is not None and not isinstance(raw, bool) else None
+    except (TypeError, ValueError):
+        vid = None
+    if vid is None:
+        raise PluginError(f"{kind} needs a VLAN id ({key}), not {raw!r}")
+    if not 1 <= vid <= 4094:
+        raise PluginError("VLAN ids go from 1 to 4094")
+    return vid
+
+
+def wanted(value: Any) -> tuple[int | None, list[int]]:
+    """port.vlans' {untagged, tagged}, checked: ids 1 to 4094, no VLAN both
+    untagged and tagged, at least one VLAN."""
+    if not isinstance(value, dict):
+        raise PluginError(f"cannot apply port.vlans with value {value!r}")
+    untagged, tagged = value.get("untagged"), value.get("tagged") or []
+    try:
+        u = int(untagged) if untagged is not None else None
+        t = sorted({int(v) for v in tagged})
+    except (TypeError, ValueError) as e:
+        raise PluginError(f"cannot apply port.vlans with value {value!r}") from e
+    if any(not 1 <= v <= 4094 for v in [*t, *([u] if u is not None else [])]):
+        raise PluginError("VLAN ids go from 1 to 4094")
+    if u is not None and u in t:
+        raise PluginError(f"VLAN {u} cannot be both untagged and tagged on one port")
+    if u is None and not t:
+        raise PluginError("a port needs an untagged VLAN or at least one tagged VLAN")
+    return u, t
+
+
 def as_list(value: Any) -> list[str]:
     """A uci option that may be a list or a space-separated string."""
     if isinstance(value, list):

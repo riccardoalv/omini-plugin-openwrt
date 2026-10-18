@@ -1005,6 +1005,11 @@ def apply(cfg: Config, change: Change) -> list[Device]:
     return collect(cfg)
 
 
+def wifi_vlan(value: dict[str, Any]) -> int:
+    """The VLAN of a wifi.set: none is the untagged LAN (VLAN 1)."""
+    return 1 if value.get("vlan") is None else vl.vlan_id(value, "vlan", "wifi.set")
+
+
 def apply_wifi(cfg: Config, change: Change) -> list[Device]:
     """wifi.set: a Wi-Fi network on every radio of the router (its name, the
     VLAN's interface, the password, on or off); wifi.delete removes it. Staged
@@ -1013,6 +1018,9 @@ def apply_wifi(cfg: Config, change: Change) -> list[Device]:
     value = change.value if isinstance(change.value, dict) else {}
     ssid = str(value.get("ssid") or "")
     previous = value.get("previous")
+    if not ssid:
+        raise PluginError(f"{change.kind} needs the network's name (ssid)")
+    vid = wifi_vlan(value)
     names = ["wireless", "network"]
     c = client_from(cfg)
     try:
@@ -1032,7 +1040,6 @@ def apply_wifi(cfg: Config, change: Change) -> list[Device]:
             ]
         else:
             ops = stage_wifi(wireless, network, value, aps)
-        vid = int(value.get("vlan") or 1)
         enabled = value.get("enabled")
 
         def done() -> bool:
@@ -1060,7 +1067,7 @@ def stage_wifi(
     each radio's access point."""
     ops: list[tuple[str, dict[str, Any]]] = []
     # No VLAN is the untagged LAN (VLAN 1): an existing network moves back to it.
-    iface, writes = wlan.plan_interface(network, int(value.get("vlan") or 1))
+    iface, writes = wlan.plan_interface(network, wifi_vlan(value))
     for kind, values in writes:
         name = values.pop("name", None)
         args: dict[str, Any] = {"config": "network", "type": kind, "values": values}
@@ -1232,8 +1239,7 @@ def apply_vlans(cfg: Config, change: Change) -> list[Device]:
         if change.kind == "port.vlans":
             port = change.port or ""
             check_port(devices, network, port)
-            untagged = int(value["untagged"]) if value.get("untagged") else None
-            tagged = sorted({int(t) for t in value.get("tagged") or []} - {untagged})
+            untagged, tagged = vl.wanted(change.value)
             ops = vl.plan_port(network, port, untagged, tagged)
             what = f"the VLANs of {port}"
 
@@ -1243,7 +1249,7 @@ def apply_vlans(cfg: Config, change: Change) -> list[Device]:
                 return tags(got) == (untagged, tagged)
 
         elif change.kind == "vlan.set":
-            vid, name = int(value["id"]), str(value.get("name") or "").strip()
+            vid, name = vl.vlan_id(value, "id", change.kind), str(value.get("name") or "").strip()
             bridge, ops = vl.plan_set(network, vid, name)
             what = f"VLAN {vid}"
 
@@ -1252,7 +1258,7 @@ def apply_vlans(cfg: Config, change: Change) -> list[Device]:
                 return (bridge, vid) in running_vlans(c) and saved.get(vid, "") == name
 
         else:
-            vid = int(value["id"])
+            vid = vl.vlan_id(value, "id", change.kind)
             ops = vl.plan_delete(network, vid)
             what = f"VLAN {vid}"
 
@@ -1298,7 +1304,7 @@ def apply_networks(cfg: Config, change: Change) -> list[Device]:
             what = f"the reservation of {mac}"
         else:
             wans = wan_names(Reader(c).required("network.interface", "dump"), configs["firewall"])
-            vid = int(value.get("vlan") or 0)
+            vid = vl.vlan_id(value, "vlan", change.kind)
             what = f"the network of VLAN {vid}"
             if change.kind == "network.set":
                 ops = nets.plan_set(configs, value, wans, urlparse(c.base).hostname)

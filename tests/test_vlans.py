@@ -185,3 +185,33 @@ def test_rolled_back_when_netifd_does_not_show_it(router, cfg):
         apply(cfg, change("port.vlans", {"untagged": 20}, "lan1"))
     assert [m for m, _ in router.writes][-1] == "rollback"
     assert router.network == FILTERING and router.confirmed == 0 and router.pending is None
+
+
+@pytest.mark.parametrize(
+    ("kind", "value", "port", "error"),
+    [
+        ("port.vlans", {"untagged": None, "tagged": []}, "lan1", "an untagged VLAN or"),
+        ("port.vlans", {"untagged": 1, "tagged": [1, 20]}, "lan2", "both untagged and tagged"),
+        ("port.vlans", {"untagged": 5000}, "lan1", "from 1 to 4094"),
+        ("port.vlans", {"untagged": "x"}, "lan1", "cannot apply port.vlans"),
+        ("vlan.set", {"name": "Cameras"}, None, "needs a VLAN id"),
+        ("vlan.set", {"id": 0, "name": "Cameras"}, None, "from 1 to 4094"),
+        ("vlan.delete", {"id": "x"}, None, "needs a VLAN id"),
+        ("network.set", {"vlan": "x", "gateway": "10.0.30.1/24"}, None, "needs a VLAN id"),
+        ("network.delete", {}, None, "needs a VLAN id"),
+    ],
+)
+def test_bad_values_are_refused_clearly(router, cfg, kind, value, port, error):
+    with pytest.raises(PluginError, match=error):
+        apply(cfg, change(kind, value, port))
+    assert router.writes == []
+
+
+@pytest.mark.parametrize(
+    ("value", "error"),
+    [({"vlan": 30}, "needs the network's name"), ({"ssid": "Guest", "vlan": "x"}, "VLAN id")],
+)
+def test_bad_wifi_values_are_refused_clearly(router, cfg, value, error):
+    with pytest.raises(PluginError, match=error):
+        apply(cfg, change("wifi.set", value, None))
+    assert router.writes == []
