@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ipaddress
 import re
-import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlparse
@@ -29,6 +28,9 @@ from omini_sdk import (
     WirelessClient,
     log,
 )
+from omini_sdk import optional as sdk_optional
+from omini_sdk.changes import Failed, Pending, apply_verify
+from omini_sdk.http import settings
 from omini_sdk.models import PortForward, Radio, RadioChange
 
 from omini_openwrt import backup as bk
@@ -82,9 +84,7 @@ def client_from(cfg: Config) -> Client:
     url, user, password = cfg.str("url"), cfg.str("username", "omini"), cfg.str("password")
     if not url or not password:
         raise PluginError("the address and the password are required")
-    return Client(
-        url, user, password, verify_tls=cfg.bool("verify_tls", False), state_dir=cfg.state_dir
-    )
+    return Client(url, user, password, state_dir=cfg.state_dir, **settings(cfg))
 
 
 # --- helpers ---------------------------------------------------------------
@@ -247,18 +247,20 @@ class Reader:
         args: dict[str, Any] | None = None,
         report: str | None = "",
     ) -> Any:
-        """Calls an optional method: None when it is refused or missing. A
-        refusal is reported under `report` (default "obj method"; None: never)."""
-        try:
-            return self.client.call(obj, method, args)
-        except AccessDenied:
-            name = f"{obj} {method}" if report == "" else report
-            if name and name not in self.denied:
-                self.denied.append(name)
-            return None
-        except UbusError as e:
-            log.debug("skipping %s", e)
-            return None
+        """Calls an optional method: None when it is refused, missing or the
+        router could not answer it (omini_sdk.optional). A refusal is reported
+        under `report` (default "obj method"; None: never)."""
+        refused: list[str] = []
+        out = sdk_optional(
+            f"ubus {obj} {method}",
+            lambda: self.client.call(obj, method, args),
+            None,
+            missing=refused,
+        )
+        name = f"{obj} {method}" if report == "" else report
+        if refused and name and name not in self.denied:
+            self.denied.append(name)
+        return out
 
     def file_read(self, path: str, report: bool = True) -> str | None:
         data = self.optional(
@@ -1329,13 +1331,7 @@ def stage_wifi(
 def wait_for(c: Client, port: str, enabled: bool) -> bool:
     """Reads the port until netifd shows it in the new state (the network
     reload runs a moment after `uci apply`)."""
-    deadline = time.monotonic() + VERIFY_S
-    while True:
-        if port_present(c, port) is enabled:
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(VERIFY_PAUSE_S)
+    return wait_until(lambda: port_present(c, port) is enabled)
 
 
 def _quietly(c: Client, method: str, args: dict[str, Any]) -> None:
@@ -1366,17 +1362,34 @@ def read_configs(c: Client, names: list[str]) -> dict[str, Any]:
 
 def wait_until(check: Any) -> bool:
     """Calls check until it holds (the reload runs a moment after `uci
-    apply`); an error answer counts as not yet. Losing the router raises."""
-    deadline = time.monotonic() + VERIFY_S
-    while True:
+    apply`), through omini_sdk.changes.apply_verify; an error answer of ubus
+    counts as not yet. Losing the router raises: uci's rollback, not an undo
+    sent from here, is what puts the configuration back then. VERIFY_S stays
+    below ROLLBACK_S, so a change is confirmed before rpcd restores the files."""
+    lost: list[PluginError] = []
+
+    def verify() -> bool:
         try:
-            if check():
-                return True
+            return bool(check())
         except UbusError as e:
-            log.debug("not yet: %s", e)
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(VERIFY_PAUSE_S)
+            raise Pending(str(e)) from e
+        except PluginError as e:
+            lost.append(e)
+            raise Failed(str(e)) from e
+
+    try:
+        apply_verify(
+            lambda: None,
+            verify,
+            timeout=VERIFY_S,
+            interval=VERIFY_PAUSE_S,
+            message="OpenWrt did not show the change",
+        )
+    except PluginError:
+        if lost:
+            raise lost[0] from None
+        return False
+    return True
 
 
 def commit(

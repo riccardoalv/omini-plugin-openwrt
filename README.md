@@ -40,7 +40,7 @@ Every method but `system board` is optional: when the ACL refuses it, or the dev
 1. `uci revert` `{"config": "network"}` — drops changes this session may have left staged (never the saved file).
 2. To disable: `uci set` `{"config": "network", "section": "<the port's device section>", "values": {"enabled": "0"}}`, or, when the port has no section of its own, `uci add` `{"config": "network", "type": "device", "values": {"name": "lan1", "enabled": "0"}}`. To enable: `uci delete` `{"config": "network", "section": "<section>", "option": "enabled"}`. The port's other options, the bridges and the interfaces are not touched.
 3. `uci apply` `{"rollback": true, "timeout": 30}` — rpcd saves the file and reloads the network, and **restores the previous file by itself after 30 seconds unless the change is confirmed**.
-4. `network.device status` `{"name": "lan1"}`, read again (up to 15 s) until netifd shows the port disabled (`"present": false`) or enabled (`"present": true`).
+4. `network.device status` `{"name": "lan1"}`, read again (every second, up to 15 s, well within the 30 s rollback; an error answer meanwhile is read again) until netifd shows the port disabled (`"present": false`) or enabled (`"present": true`).
 5. Only then `uci confirm` `{}`: the change stays. If the port did not change, the plugin calls `uci rollback` `{}` instead; if the router stopped answering (the port was the way to it), it is not confirmed, and rpcd restores the previous configuration on its own.
 
 A disabled port is down for netifd (it leaves it out of the bridge), stays down after a reboot, and appears as **Disabled** on the map. The plugin refuses the switch's CPU port (`eth0` on most routers, which carries every LAN port), bridges, VLANs and Wi-Fi interfaces, and routers whose switch uses **swconfig** (older devices with `config switch` sections), where ports are not separate devices.
@@ -123,6 +123,7 @@ If another change applied from LuCI is still waiting to be confirmed, the plugin
 
 ## Requirements
 
+- Omini **1.7 or later** (the plugin uses the SDK's HTTP client, optional reads and change checks it ships).
 - OpenWrt **21.02 or later** with LuCI installed (it brings `uhttpd-mod-ubus`, which serves `/ubus`, and `rpcd-mod-luci` / `luci-rpc`). On a build without LuCI, install `uhttpd-mod-ubus` (and `rpcd-mod-iwinfo` for Wi-Fi).
 - An rpcd login for Omini (below). Using `root` works too, but gives Omini far more access than it needs.
 
@@ -208,12 +209,14 @@ rpcd logins are not system users: each is an entry in `/etc/config/rpcd` that ma
 | Address | — | The LuCI address, e.g. `https://192.168.1.1` (or `http://` if LuCI has no HTTPS; with no scheme, `https://` is used) |
 | Username | `omini` | The rpcd login |
 | Password | — | Secret: stored encrypted by Omini, never logged |
-| Verify the TLS certificate | off | OpenWrt uses a self-signed certificate by default |
+| Verify the TLS certificate (Advanced) | off | OpenWrt uses a self-signed certificate by default |
+| Timeout (Advanced) | 15 | Seconds to wait for each answer of the router; a refused connection or a busy router (429/503) is asked again (twice, with a pause) |
 
 ## How it works
 
 - Every request is a JSON-RPC 2.0 `POST` to `<address>/ubus` ([ubus over HTTP](https://openwrt.org/docs/techref/ubus)). POST is how JSON-RPC carries a call; collecting calls only methods that read, and only a change calls the uci methods above.
-- `session login` (with the username and password) returns a session id (`ubus_rpc_session`); every `call` carries it. The session is kept in the plugin's state folder and reused while it is valid — rpcd sessions expire after 5 minutes without use, and each use renews them. When ubus refuses a reused session (`Access denied`, -32002), the plugin logs in again once.
+- `session login` (with the username and password) returns a session id (`ubus_rpc_session`); every `call` carries it. The session is kept in the plugin's state folder (`session.json`, readable only by Omini, tied to a hash of the address and credentials) and reused while it is valid — rpcd sessions expire after 5 minutes without use, and each use renews them. When ubus refuses a reused session (`Access denied`, -32002), the plugin logs in again once. After rpcd refuses the username or password, the plugin waits 10 minutes before trying them again (kept in `login-refused.json`); changing them in Omini retries at once, and a router that is out of reach is asked again on the next run.
+- An optional method the router cannot answer (refused by the ACL, missing, or a server error) is skipped and logged once; it never fails the whole collection.
 - Methods ([ubus reference](https://openwrt.org/docs/techref/ubus), [rpcd](https://openwrt.org/docs/techref/rpcd)):
   - `system board`, `system info` (procd): `load` values are scaled by 65536; `root` and `tmp` sizes are in KiB.
   - `network.device status`, `network.interface dump` (netifd): `speed` such as `1000F` (Mbps + duplex); `bridge-vlans` ports read `lan1` (untagged), `lan1:t` (tagged), `lan1:*` (PVID); a WAN is a logical interface off the LAN side with a `0.0.0.0/0` or `::/0` route, its `nexthop` is the gateway, and a PPPoE `l3_device` (`pppoe-wan`) runs on its `device`.

@@ -85,6 +85,35 @@ def test_rolled_back_and_not_saved_when_the_port_did_not_change(openwrt, cfg):
     assert openwrt.pending is None and openwrt.staged == {}
 
 
+def test_a_read_that_fails_while_the_network_reloads_is_read_again(openwrt, cfg, monkeypatch):
+    monkeypatch.setattr(collect_module, "VERIFY_S", 5)
+    monkeypatch.setattr(collect_module, "VERIFY_PAUSE_S", 1)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    real = collect_module.port_present
+    answers = iter([collect_module.Unavailable("network.device status: status 4")])
+
+    def flaky(c, port):
+        for e in answers:
+            raise collect_module.UbusError(str(e))
+        return real(c, port)
+
+    monkeypatch.setattr(collect_module, "port_present", flaky)
+    apply(cfg, change())
+    assert openwrt.confirmed == 1
+
+
+def test_losing_the_router_leaves_the_rollback_to_rpcd(openwrt, cfg, monkeypatch):
+    from omini_sdk.http import Unavailable as Lost
+
+    def gone(c, port):
+        raise Lost("cannot connect to https://192.168.1.1")
+
+    monkeypatch.setattr(collect_module, "port_present", gone)
+    with pytest.raises(PluginError, match="lost OpenWrt after changing lan1: it restores"):
+        apply(cfg, change())
+    assert [m for m, _ in openwrt.writes] == ["add", "apply"] and openwrt.confirmed == 0
+
+
 def test_nothing_is_sent_when_the_port_is_already_so(openwrt, cfg):
     apply(cfg, change(value=True))
     openwrt.network["values"]["cfg040f15"]["enabled"] = "0"

@@ -180,6 +180,53 @@ def test_wrong_credentials(openwrt, cfg):
         collect(cfg)
 
 
+def test_a_refused_password_waits_before_the_next_login(openwrt, cfg):
+    cfg["password"] = "wrong"
+    with pytest.raises(PluginError, match="rejected the username or password"):
+        collect(cfg)
+    with pytest.raises(PluginError, match="waiting a few minutes"):
+        collect(cfg)
+    assert openwrt.logins == 0
+    cfg["password"] = "secret"  # other credentials are tried at once
+    [dev] = collect(cfg)
+    assert dev.name == "gw-office" and not (cfg.state_dir / "login-refused.json").exists()
+
+
+def test_an_old_session_file_costs_one_login(openwrt, cfg):
+    cfg.state_dir.mkdir(parents=True)
+    (cfg.state_dir / "session.json").write_text(
+        json.dumps({"url": "https://192.168.1.1", "username": "omini", "session": "f" * 32})
+    )
+    collect(cfg)
+    assert openwrt.logins == 1
+
+
+def test_the_timeout_comes_from_the_form(cfg):
+    from omini_openwrt.collect import client_from
+
+    assert client_from(cfg).http.timeout.read == 15
+    cfg["timeout_s"] = 40
+    cfg["verify_tls"] = True
+    assert client_from(cfg).http.timeout.read == 40
+
+
+def test_an_optional_method_that_fails_is_skipped(openwrt, cfg, monkeypatch):
+    import omini_openwrt.collect as m
+    from omini_openwrt.client import Client
+
+    def handler(request):
+        if json.loads(request.content)["params"][1] == "luci-rpc":
+            return httpx.Response(502, text="Bad Gateway")
+        return openwrt.handler(request)
+
+    monkeypatch.setattr(
+        m, "Client", lambda *a, **k: Client(*a, **k, transport=httpx.MockTransport(handler))
+    )
+    # Before, a server error of an optional method failed the whole collection.
+    [dev] = collect(cfg)
+    assert dev.name == "gw-office" and dev.hosts is None and dev.interfaces
+
+
 def test_required_method_refused(openwrt, cfg):
     openwrt.denied = {"system board"}
     with pytest.raises(PluginError, match="does not allow ubus system board"):
@@ -201,10 +248,16 @@ def test_not_openwrt(cfg, monkeypatch):
 
 
 def test_unreachable(cfg, monkeypatch):
+    import time
+
     import omini_openwrt.collect as m
     from omini_openwrt.client import Client
 
+    tries = []
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+
     def handler(request):
+        tries.append(request)
         raise httpx.ConnectError("connection refused")
 
     monkeypatch.setattr(
@@ -212,6 +265,9 @@ def test_unreachable(cfg, monkeypatch):
     )
     with pytest.raises(PluginError, match="cannot connect"):
         collect(cfg)
+    assert len(tries) == 3  # a refused connection is asked again twice
+    # An unreachable router is not a refused password: no waiting next time.
+    assert not (cfg.state_dir / "login-refused.json").exists()
 
 
 def test_session_is_kept_and_renewed(openwrt, cfg):
@@ -219,7 +275,7 @@ def test_session_is_kept_and_renewed(openwrt, cfg):
     collect(cfg)
     assert openwrt.logins == 1  # the saved session was reused
     saved = json.loads((cfg.state_dir / "session.json").read_text())
-    assert saved["username"] == "omini" and "secret" not in json.dumps(saved)
+    assert saved["data"] == {"session": f"{1:032x}"} and "secret" not in json.dumps(saved)
     openwrt.expire_sessions()  # 5 minutes without use
     [dev] = collect(cfg)
     assert openwrt.logins == 2 and dev.name == "gw-office"
